@@ -17,8 +17,7 @@ specification are all designed around that one fixed shape on purpose.
 SmolLM2 (1.7B parameters) has been tested on NEON: it produces coherent
 text, follows prompts, and also works somewhat with the idle-loop feature.
 
-> **Status: beta.** NEON is solo-maintained and has had no independent
-> security audit yet. Licensed under the
+> Licensed under the
 > **[GNU Affero General Public License v3.0](./LICENSE)** (AGPLv3).
 
 ## Contents
@@ -140,6 +139,89 @@ they are used by including the headers from your own program.
   model has been run through NEON yet.
 - Single maintainer, no independent security audit yet (see
   [`SECURITY.md`](./SECURITY.md)).
+
+## Performance (CPU AVX2 Only Tested)
+ <h2>CPU Performance — AVX2</h2>
+
+<p>
+  <strong>CPU:</strong> Intel Core i5-10400 @ 2.90 GHz<br>
+  <strong>Model:</strong> Qwen2.5-0.5B, Q4_0<br>
+  <strong>Test:</strong> 512 prompt tokens, 256 generated tokens, 5 repetitions<br>
+  <strong>NEON:</strong> AVX2, FMA · <strong>llama.cpp:</strong> Release, AVX2, FMA, F16C, BMI2
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Threads</th>
+      <th>Runtime</th>
+      <th>Prefill (tok/s) ↑</th>
+      <th>Decode (tok/s) ↑</th>
+      <th>Host RSS (MB) ↓</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td rowspan="2">6</td>
+      <td><strong>NEON</strong></td>
+      <td><strong>639.18 ± 10.78</strong></td>
+      <td>45.90 ± 2.11</td>
+      <td>757</td>
+    </tr>
+    <tr>
+      <td>llama.cpp</td>
+      <td>531.03 ± 10.16</td>
+      <td><strong>52.18 ± 0.21</strong></td>
+      <td>674</td>
+    </tr>
+    <tr>
+      <td rowspan="2">12</td>
+      <td><strong>NEON</strong></td>
+      <td><strong>726.57 ± 4.26</strong></td>
+      <td>42.38 ± 7.74</td>
+      <td>757</td>
+    </tr>
+    <tr>
+      <td>llama.cpp</td>
+      <td>397.85 ± 19.58</td>
+      <td>37.46 ± 13.64</td>
+      <td><strong>674</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Relative Performance</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>Threads</th>
+      <th>Prefill Ratio</th>
+      <th>Decode Ratio</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>6</td>
+      <td><strong>1.20× (+20.3%)</strong></td>
+      <td>0.88× (−12.0%)</td>
+    </tr>
+    <tr>
+      <td>12</td>
+      <td><strong>1.83× (+82.6%)</strong></td>
+      <td><strong>1.13× (+13.1%)</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+  <sub>
+    Prefill measures prompt-processing throughput; decode measures
+    token-generation throughput. Ratios above 1.00× indicate higher
+    NEON throughput. Results are specific to this hardware, model pair,
+    build configuration, and benchmark run.
+  </sub>
+</p>
 
 ## Out of scope
 
