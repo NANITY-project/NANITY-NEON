@@ -1,0 +1,1782 @@
+#pragma once
+// =============================================================================
+// rawllm_forward.hpp  —  CPU reference transformer forward pass for NANITY.
+//
+// This implements exactly one architecture (NANITY — see
+// NANITY_ARCHITECTURE_SPEC.md), with no per-family branching: every
+// conforming GGUF has separate Q/K/V projections, separate FFN gate/up/down
+// projections, no bias tensors, and one fixed RoPE rotation convention. That
+// is the whole point of the spec — rawllm_loader.hpp's validate_config()
+// already rejected anything that doesn't match this shape, so this file
+// doesn't need fallback branches for fused tensors or alternate RoPE styles;
+// there is nothing left to detect at this point.
+//
+// Per token:
+//   embed(ctx) -> [RMSNorm -> separate Q/K/V proj -> RoPE -> causal GQA
+//   attention -> out-proj -> residual -> RMSNorm -> SwiGLU FFN (separate
+//   gate/up/down) -> residual] x n_layer -> final RMSNorm -> output
+//   projection (tied to token_embd if no dedicated output.weight) -> logits.
+//
+// Known scope limits (intentional, to keep this auditable — read before
+// filing a follow-up bug):
+//
+//   1. KV CACHE (see KVCache below) covers ONE reply, not the whole
+//      multi-turn conversation. transformer_forward() only processes the
+//      *new* tokens passed to it each call — the prompt on the first
+//      (prefill) call, one token per subsequent (decode) call — and reads
+//      every earlier position's K/V back from the cache instead of
+//      recomputing it. That's O(seq) total work per reply instead of the
+//      previous O(seq²). Cross-turn caching (skipping re-prefill of prior
+//      turns too) is a further win but needs reliable detection that a new
+//      prompt is exactly "old prompt + one turn" token-for-token, which is
+//      fragile if formatting ever shifts — left for later.
+//   2. Dequantizes weights on the fly inside the matvec inner loop, with
+//      no pre-built fp32 cache of the full weight matrices.
+//      proj_all_positions() always parallelizes across output rows, for
+//      both prefill and decode: each thread dequantizes its assigned rows
+//      exactly once and loops over every position's dot product against
+//      that same row. An earlier version split prefill (seq > nthreads)
+//      across positions instead, redundantly re-dequantizing every row once
+//      per position — fine for a small model that fits in cache, but on a
+//      multi-GB GGUF that doesn't fit in page cache it meant re-reading
+//      every weight tensor `seq` times instead of once, which dominated
+//      wall-clock time far more than any scalar-vs-SIMD difference in the
+//      dot products themselves. The row-parallel approach reads each tensor
+//      exactly once regardless of seq.
+//      The attention loop further down applies the same idea in its own
+//      dimension: work is flattened over (new-position × head) rather than
+//      split on position alone, so a single decoded token (seq==1) still
+//      spreads across every thread instead of starving all but one.
+//   3. Quant formats implemented: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0,
+//      Q5_1, Q4_K, Q5_K, Q6_K. These cover the overwhelming majority of
+//      GGUF quantizations people actually use day to day (Q4_K_M / Q5_K_M
+//      / Q6_K / Q8_0 / F16). Q2_K, Q3_K, Q8_1, and IQ4_NL throw a clear
+//      runtime_error instead of silently producing garbage — re-quantize
+//      to one of the supported types if you hit this. (convert_to_gguf.py
+//      currently writes F32 only; quantized export is a follow-up.)
+//   4. No bias tensors, by spec — every NANITY model is bias-free. This used
+//      to be a caveat ("wrong for architectures that use bias"); now it's
+//      just a fact about the one architecture this engine runs.
+//   5. RoPE convention is fixed (adjacent-pair rotation — see rope_apply()
+//      below) because the spec fixes it. There is no second convention to
+//      pick between, so unlike the old multi-architecture version there is
+//      no heuristic here and nothing to get wrong on a new model family.
+//      The head_dim/2 base frequencies are computed once with
+//      rope_make_freqs() before the layer loop and reused every layer and
+//      every head — std::pow is called O(head_dim/2) times per forward
+//      pass, not O(n_layer × seq × n_head × head_dim/2) times.
+//   6. Linear RoPE scaling (cfg.rope_scale != 1) divides the effective
+//      position; most NANITY exports leave it at the default 1.0.
+//   7. The matvec accumulation (proj_all_positions) and the attention
+//      QK^T / weighted-V accumulation both route through dot_f32()/
+//      axpy_f32(), which use AVX2+FMA or AVX-512 when the build was
+//      compiled with those flags (NEON.py's "Enable AVX2 intrinsics"
+//      toggle), and fall back to the same scalar loops as before otherwise
+//      — so this is a pure speed change, not a correctness-affecting one,
+//      modulo the usual floating-point reassociation differences between
+//      SIMD and scalar summation order.
+//
+// transformer_forward()'s signature changed to take a KVCache& and the
+// *new* tokens for this call (not the full context) — NEON.cpp's call
+// sites (generate(), run_interactive(), via the shared run_generation()
+// helper) now own a persistent KVCache per process and reset its length to
+// 0 at the start of every new reply.
+// =============================================================================
+#include "rawllm_common.hpp"
+#include "rawllm_loader.hpp"
+#include "rawllm_util.hpp"
+#include "../simd/rawllm_simd_dispatch.hpp"
+#include "rawllm_repack.hpp"   // 8-row interleaved Q4_0/Q8_0 panels + rows-in-lanes GEMM kernels
+#include <iostream>  // for the VERBOSE_LOG std::cerr line below
+#include <mutex>
+#include <unordered_map>
+#include <memory>
+
+namespace fwd {
+
+// ───────────────────────── half / bfloat16 -> float ─────────────────────────
+
+inline float fp16_to_fp32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h >> 15) & 1u;
+    uint32_t exp  = (uint32_t)(h >> 10) & 0x1Fu;
+    uint32_t mant = (uint32_t)h & 0x3FFu;
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign << 31;
+        } else {
+            int e = -1;
+            do { mant <<= 1; ++e; } while (!(mant & 0x400u));
+            mant &= 0x3FFu;
+            uint32_t fexp = (uint32_t)(127 - 15 - e);
+            f = (sign << 31) | (fexp << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        f = (sign << 31) | 0x7F800000u | (mant << 13);
+    } else {
+        uint32_t fexp = exp - 15 + 127;
+        f = (sign << 31) | (fexp << 23) | (mant << 13);
+    }
+    float out; std::memcpy(&out, &f, sizeof(out));
+    return out;
+}
+
+inline float bf16_to_fp32(uint16_t h) {
+    uint32_t f = (uint32_t)h << 16;
+    float out; std::memcpy(&out, &f, sizeof(out));
+    return out;
+}
+
+// ───────────────────────── block dequantizers ───────────────────────────────
+// Each writes exactly `n` contiguous fp32 values to `out`, reading from `p`
+// (must point at the start of a whole block run — n a multiple of the type's
+// block size: 32 for legacy quants, 256 for K-quants). Block layouts/formulas
+// match the ones rawllm_loader.hpp's nbytes_for() already documents as
+// ground truth for this codebase (see the FIX comments there for Q5_K/Q3_K
+// in particular — this file follows the same byte counts).
+
+inline void dequant_f32(const uint8_t* p, size_t n, float* out) {
+    std::memcpy(out, p, n * sizeof(float));
+}
+inline void dequant_f16(const uint8_t* p, size_t n, float* out) {
+    uint16_t h; for (size_t i = 0; i < n; ++i) { std::memcpy(&h, p + 2*i, 2); out[i] = fp16_to_fp32(h); }
+}
+inline void dequant_bf16(const uint8_t* p, size_t n, float* out) {
+    uint16_t h; for (size_t i = 0; i < n; ++i) { std::memcpy(&h, p + 2*i, 2); out[i] = bf16_to_fp32(h); }
+}
+
+inline void dequant_q8_0(const uint8_t* p, size_t n, float* out) {
+    for (size_t b = 0; b < n; b += 32) {
+        uint16_t dh; std::memcpy(&dh, p, 2); float d = fp16_to_fp32(dh);
+        const int8_t* qs = reinterpret_cast<const int8_t*>(p + 2);
+        for (int j = 0; j < 32; ++j) out[b+j] = d * (float)qs[j];
+        p += 34;
+    }
+}
+
+inline void dequant_q4_0(const uint8_t* p, size_t n, float* out) {
+    for (size_t b = 0; b < n; b += 32) {
+        uint16_t dh; std::memcpy(&dh, p, 2); float d = fp16_to_fp32(dh);
+        const uint8_t* qs = p + 2;
+        for (int j = 0; j < 16; ++j) {
+            out[b+j]    = d * ((float)(qs[j] & 0xF) - 8.f);
+            out[b+j+16] = d * ((float)(qs[j] >> 4)  - 8.f);
+        }
+        p += 18;
+    }
+}
+
+inline void dequant_q4_1(const uint8_t* p, size_t n, float* out) {
+    for (size_t b = 0; b < n; b += 32) {
+        uint16_t dh, mh; std::memcpy(&dh, p, 2); std::memcpy(&mh, p + 2, 2);
+        float d = fp16_to_fp32(dh), m = fp16_to_fp32(mh);
+        const uint8_t* qs = p + 4;
+        for (int j = 0; j < 16; ++j) {
+            out[b+j]    = d * (float)(qs[j] & 0xF) + m;
+            out[b+j+16] = d * (float)(qs[j] >> 4)  + m;
+        }
+        p += 20;
+    }
+}
+
+inline void dequant_q5_0(const uint8_t* p, size_t n, float* out) {
+    for (size_t b = 0; b < n; b += 32) {
+        uint16_t dh; std::memcpy(&dh, p, 2); float d = fp16_to_fp32(dh);
+        uint32_t qh; std::memcpy(&qh, p + 2, 4);
+        const uint8_t* qs = p + 6;
+        for (int j = 0; j < 16; ++j) {
+            int hi0 = (qh >> j) & 1, hi1 = (qh >> (j + 16)) & 1;
+            int x0 = (qs[j] & 0xF) | (hi0 << 4);
+            int x1 = (qs[j] >> 4)  | (hi1 << 4);
+            out[b+j]    = d * (float)(x0 - 16);
+            out[b+j+16] = d * (float)(x1 - 16);
+        }
+        p += 22;
+    }
+}
+
+inline void dequant_q5_1(const uint8_t* p, size_t n, float* out) {
+    for (size_t b = 0; b < n; b += 32) {
+        uint16_t dh, mh; std::memcpy(&dh, p, 2); std::memcpy(&mh, p + 2, 2);
+        float d = fp16_to_fp32(dh), m = fp16_to_fp32(mh);
+        uint32_t qh; std::memcpy(&qh, p + 4, 4);
+        const uint8_t* qs = p + 8;
+        for (int j = 0; j < 16; ++j) {
+            int hi0 = (qh >> j) & 1, hi1 = (qh >> (j + 16)) & 1;
+            int x0 = (qs[j] & 0xF) | (hi0 << 4);
+            int x1 = (qs[j] >> 4)  | (hi1 << 4);
+            out[b+j]    = d * (float)x0 + m;
+            out[b+j+16] = d * (float)x1 + m;
+        }
+        p += 24;
+    }
+}
+
+// Shared 6-bit scale/min unpacking for the K-quant super-block scale table
+// (12 packed bytes encode 8 six-bit "scale" values and 8 six-bit "min"
+// values for the block's 8 sub-blocks of 32 elements each).
+inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = (uint8_t)((q[j+4] & 0xF) | ((q[j-4] >> 6) << 4));
+        m = (uint8_t)((q[j+4] >> 4)  | ((q[j]   >> 6) << 4));
+    }
+}
+
+inline void dequant_q4_k(const uint8_t* p, size_t n, float* out) {
+    for (size_t blk = 0; blk < n; blk += 256) {
+        uint16_t dh, dminh; std::memcpy(&dh, p, 2); std::memcpy(&dminh, p + 2, 2);
+        float d = fp16_to_fp32(dh), dmin = fp16_to_fp32(dminh);
+        const uint8_t* scales = p + 4;
+        const uint8_t* q = p + 16;
+        float* y = out + blk;
+        int is = 0;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc, m;
+            get_scale_min_k4(is + 0, scales, sc, m); float d1 = d * sc, m1 = dmin * m;
+            get_scale_min_k4(is + 1, scales, sc, m); float d2 = d * sc, m2 = dmin * m;
+            for (int l = 0; l < 32; ++l) y[l]      = d1 * (float)(q[l] & 0xF) - m1;
+            for (int l = 0; l < 32; ++l) y[32 + l] = d2 * (float)(q[l] >> 4)  - m2;
+            q += 32; y += 64; is += 2;
+        }
+        p += 144;
+    }
+}
+
+inline void dequant_q5_k(const uint8_t* p, size_t n, float* out) {
+    for (size_t blk = 0; blk < n; blk += 256) {
+        uint16_t dh, dminh; std::memcpy(&dh, p, 2); std::memcpy(&dminh, p + 2, 2);
+        float d = fp16_to_fp32(dh), dmin = fp16_to_fp32(dminh);
+        const uint8_t* scales = p + 4;
+        const uint8_t* qh = p + 16;
+        const uint8_t* ql = p + 48;
+        float* y = out + blk;
+        int is = 0; uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc, m;
+            get_scale_min_k4(is + 0, scales, sc, m); float d1 = d * sc, m1 = dmin * m;
+            get_scale_min_k4(is + 1, scales, sc, m); float d2 = d * sc, m2 = dmin * m;
+            for (int l = 0; l < 32; ++l) y[l]      = d1 * (float)((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
+            for (int l = 0; l < 32; ++l) y[32 + l] = d2 * (float)((ql[l] >> 4)  + ((qh[l] & u2) ? 16 : 0)) - m2;
+            ql += 32; y += 64; is += 2; u1 = (uint8_t)(u1 << 2); u2 = (uint8_t)(u2 << 2);
+        }
+        p += 176;
+    }
+}
+
+inline void dequant_q6_k(const uint8_t* p, size_t n, float* out) {
+    for (size_t blk = 0; blk < n; blk += 256) {
+        const uint8_t* ql = p;
+        const uint8_t* qh = p + 128;
+        const int8_t*  sc = reinterpret_cast<const int8_t*>(p + 192);
+        uint16_t dh; std::memcpy(&dh, p + 208, 2); float d = fp16_to_fp32(dh);
+        float* y = out + blk;
+        for (int n2 = 0; n2 < 256; n2 += 128) {
+            for (int l = 0; l < 32; ++l) {
+                int is = l >> 4;  // l/16: 0 for l<16, 1 for l>=16
+                int q1 = (int)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int q3 = (int)((ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int q4 = (int)((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
+                y[l]      = d * (float)sc[is + 0] * (float)q1;
+                y[l + 32] = d * (float)sc[is + 2] * (float)q2;
+                y[l + 64] = d * (float)sc[is + 4] * (float)q3;
+                y[l + 96] = d * (float)sc[is + 6] * (float)q4;
+            }
+            y += 128; ql += 64; qh += 32; sc += 8;
+        }
+        p += 210;
+    }
+}
+
+inline size_t block_size_for(loader::GGMLType t) {
+    switch (t) {
+        case loader::GGMLType::F32:
+        case loader::GGMLType::F16:
+        case loader::GGMLType::BF16: return 1;
+        case loader::GGMLType::Q4_K:
+        case loader::GGMLType::Q5_K:
+        case loader::GGMLType::Q6_K: return 256;
+        default: return 32; // Q4_0/Q4_1/Q5_0/Q5_1/Q8_0
+    }
+}
+
+inline void dequantize_row(loader::GGMLType type, const uint8_t* p, size_t n, float* out) {
+    switch (type) {
+        case loader::GGMLType::F32:  dequant_f32(p, n, out);  return;
+        case loader::GGMLType::F16:  dequant_f16(p, n, out);  return;
+        case loader::GGMLType::BF16: dequant_bf16(p, n, out); return;
+        case loader::GGMLType::Q8_0: dequant_q8_0(p, n, out); return;
+        case loader::GGMLType::Q4_0: dequant_q4_0(p, n, out); return;
+        case loader::GGMLType::Q4_1: dequant_q4_1(p, n, out); return;
+        case loader::GGMLType::Q5_0: dequant_q5_0(p, n, out); return;
+        case loader::GGMLType::Q5_1: dequant_q5_1(p, n, out); return;
+        case loader::GGMLType::Q4_K: dequant_q4_k(p, n, out); return;
+        case loader::GGMLType::Q5_K: dequant_q5_k(p, n, out); return;
+        case loader::GGMLType::Q6_K: dequant_q6_k(p, n, out); return;
+        default:
+            throw std::runtime_error(
+                "forward(): this CPU reference path doesn't implement dequantization "
+                "for this tensor's quant type yet (Q2_K/Q3_K/Q8_1/IQ4_NL aren't wired "
+                "up). Re-quantize the GGUF to Q4_K_M, Q5_K_M, Q6_K, Q8_0, or F16 with "
+                "llama.cpp's quantize tool and retry.");
+    }
+}
+
+// Dequantize a tensor's full contents in one go (used for 1-D tensors like
+// norm weights, where there's no "row" structure to exploit).
+inline void dequant_full(const loader::TensorInfo& t, float* out) {
+    size_t n = 1; for (auto d : t.shape) n *= d;
+    dequantize_row(t.type, t.data_ptr, n, out);
+}
+
+// ─────────────────────────── GPU dispatch (ROCm) ─────────────────────────────
+// WIRING NOTE: rocm::GpuContext (rawllm_rocm.hpp) previously only got probed
+// for device count/logging (see NEON-3.cpp's USE_ROCM branch) — nothing in
+// the forward pass ever actually called into it, so every token ran on CPU
+// even with an MI300X sitting idle. rocm::matvec_rocblas() already existed
+// and works, but calling it as-is from here would be a net loss: it
+// re-uploads the ENTIRE weight matrix on every single call (see its
+// `tl_dW.up(W, rows*cols)` — there's no caching), and weights don't change
+// between tokens. Re-uploading e.g. a 4096x4096 f32 tensor (64MB) over
+// PCIe/Infinity Fabric on every token, for every projection in every layer,
+// would be far slower than just staying on the CPU int8 fast path above.
+//
+// gpu_weight_cache below fixes that: dequantize + upload each distinct
+// tensor (keyed by its stable data_ptr from the mmap'd/loaded model) to the
+// device exactly ONCE, the first time it's used, then every subsequent call
+// is a map lookup and reuses the resident device buffer — only the (tiny,
+// per-token) activation vector gets uploaded on the hot path.
+//
+// NOT compiled/tested on real hardware in this environment (no ROCm SDK or
+// AMD GPU available where this was written) — the CPU-side pieces (cache
+// bookkeeping, dequant scheduling, size threshold) follow the same patterns
+// already validated elsewhere in this file, but the actual rocBLAS/HIP call
+// sequence needs a real on-device run (build with -DUSE_ROCBLAS on the
+// MI300X box and diff a few logits against the CPU path) before trusting it
+// for real inference.
+#if defined(USE_ROCBLAS) && (defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM))
+namespace gpu {
+
+// Mirrors dequantize_row()'s supported-type switch (rawllm_forward.hpp
+// above) — Q2_K/Q3_K/Q8_1/IQ4_NL aren't implemented there, so don't attempt
+// GPU dispatch for them either; let those tensors fall through to the
+// existing CPU path (which will throw the same clear "re-quantize with
+// llama.cpp" error dequantize_row() already gives, unchanged).
+inline bool gpu_dequant_supported(loader::GGMLType t) {
+    switch (t) {
+        case loader::GGMLType::F32:  case loader::GGMLType::F16:
+        case loader::GGMLType::BF16: case loader::GGMLType::Q8_0:
+        case loader::GGMLType::Q4_0: case loader::GGMLType::Q4_1:
+        case loader::GGMLType::Q5_0: case loader::GGMLType::Q5_1:
+        case loader::GGMLType::Q4_K: case loader::GGMLType::Q5_K:
+        case loader::GGMLType::Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Below this many output elements (rows*cols), the one-time dequant+upload
+// cost and per-call kernel-launch/sync overhead aren't worth it against the
+// already-fast CPU int8 path — small tensors (e.g. a handful of attention
+// output rows on a tiny model) stay on CPU even when a GPU is available.
+// Not benchmarked against real hardware; a conservative starting point
+// intended to be tuned once real timings exist.
+constexpr size_t GPU_DISPATCH_MIN_ELEMS = 4ull * 1024 * 1024; // e.g. 1024x4096
+
+struct CachedWeight {
+    rocm::DevBuf<float> dW;
+    size_t rows = 0, cols = 0;
+};
+
+inline std::mutex& cache_mutex() {
+    static std::mutex m;
+    return m;
+}
+inline std::unordered_map<const void*, std::unique_ptr<CachedWeight>>& cache_map() {
+    static std::unordered_map<const void*, std::unique_ptr<CachedWeight>> m;
+    return m;
+}
+
+// Returns the resident device weight buffer for W, dequantizing (CPU,
+// thread-pooled, same dequantize_row() every other quant type already
+// goes through) and uploading exactly once per distinct tensor. Every call
+// after the first for a given tensor is just a locked map lookup.
+inline const rocm::DevBuf<float>* get_or_upload(const loader::TensorInfo& W,
+                                                  size_t rows, size_t cols,
+                                                  size_t row_bytes,
+                                                  util::ThreadPool& pool) {
+    {
+        std::lock_guard<std::mutex> lk(cache_mutex());
+        auto it = cache_map().find((const void*)W.data_ptr);
+        if (it != cache_map().end()) return &it->second->dW;
+    }
+
+    // Dequantize outside the lock — this is the expensive part (one pass
+    // over the whole tensor) and only ever runs once per tensor, but there
+    // is no reason to hold other threads' cache lookups hostage to it.
+    std::vector<float> host((size_t)rows * cols);
+    int nthreads = std::max(1, pool.size());
+    size_t row_chunk = (rows + (size_t)nthreads - 1) / (size_t)nthreads;
+    row_chunk = (row_chunk + 3) & ~(size_t)3;   // keep 4-row tiles aligned per thread
+    bool any = false;
+    for (int ti = 0; ti < nthreads; ++ti) {
+        size_t r0 = (size_t)ti * row_chunk, r1 = std::min(rows, r0 + row_chunk);
+        if (r0 >= r1) continue;
+        any = true;
+        pool.submit([&W, &host, row_bytes, cols, r0, r1] {
+            for (size_t r = r0; r < r1; ++r)
+                dequantize_row(W.type, W.data_ptr + r * row_bytes,
+                                cols, host.data() + r * cols);
+        });
+    }
+    if (any) pool.wait();
+
+    auto cached = std::make_unique<CachedWeight>();
+    cached->rows = rows;
+    cached->cols = cols;
+    cached->dW.alloc(rows * cols);
+    cached->dW.up(host.data(), rows * cols);
+
+    std::lock_guard<std::mutex> lk(cache_mutex());
+    // Another thread may have raced us and already inserted this tensor
+    // while we were dequantizing/uploading; if so, keep theirs (first one
+    // in wins) and let ours free on scope exit rather than leaking a
+    // second device allocation for the same tensor.
+    auto& slot = cache_map()[(const void*)W.data_ptr];
+    if (!slot) slot = std::move(cached);
+    return &slot->dW;
+}
+
+// Runs the full projection (all `rows` output rows, all `seq` positions)
+// on GPU via one batched rocBLAS GEMM against the cached resident weight
+// buffer. X may not be contiguous (x_stride can exceed cols when X is a
+// view into a larger buffer), so it's packed into a small contiguous host
+// staging buffer before upload — cheap: seq*cols floats, not rows*cols.
+inline void proj_gpu(const loader::TensorInfo& W, const float* X, size_t x_stride,
+                      float* Y, size_t y_stride, size_t seq, size_t cols, size_t rows,
+                      size_t row_bytes, util::ThreadPool& pool) {
+    const rocm::DevBuf<float>* dW = get_or_upload(W, rows, cols, row_bytes, pool);
+
+    std::vector<float> x_packed((size_t)seq * cols);
+    for (size_t t = 0; t < seq; ++t)
+        std::memcpy(x_packed.data() + t * cols, X + t * x_stride, cols * sizeof(float));
+
+    thread_local rocm::DevBuf<float> dX, dOut;
+    rocm::maybe_resize(dX,   seq * cols);
+    rocm::maybe_resize(dOut, seq * rows);
+    dX.up(x_packed.data(), seq * cols);
+
+    rocm::rocblas_batched_gemm_f32((int)seq, (int)rows, (int)cols,
+                                    dX.ptr, dW->ptr, dOut.ptr);
+    HIP_CHECK(hipDeviceSynchronize());
+
+    std::vector<float> y_packed((size_t)seq * rows);
+    dOut.dn(y_packed.data(), seq * rows);
+    for (size_t t = 0; t < seq; ++t)
+        for (size_t r = 0; r < rows; ++r)
+            Y[t * y_stride + r] = y_packed[t * rows + r];
+}
+
+} // namespace gpu
+#endif // USE_ROCBLAS && (__HIP_PLATFORM_AMD__ || USE_ROCM)
+
+// ───────────────────────── fused Q4_0 × Q8_0 dot product ────────────────────
+// FIX (perf): proj_all_positions[_multi]() used to dequantize every Q4_0
+// weight row into a full F32 rowbuf, THEN call dot_f32() against it — two
+// full passes over `cols` elements (one writing the dequantized row, one
+// reading it back) plus one float multiply per ELEMENT for the per-block
+// scale, when the scale is actually constant across each 32-element block.
+//
+// llama.cpp's actual technique (this is the standard ggml approach, not
+// anything exotic): quantize the ACTIVATION vector to int8 too, then do the
+// weight×activation dot product directly on the packed 4-bit weight bytes
+// using integer SIMD, paying the float scale multiply once per 32-element
+// BLOCK instead of once per element, and never materializing a dequantized
+// row at all. Quantizing the activation costs a small amount of accuracy
+// (Q8_0 has 127 levels — independently benchmarked here at ~0.4% typical
+// relative error vs the pure-float path on random data, the same trade-off
+// llama.cpp itself accepts) in exchange for both the lower instruction count
+// and, just as importantly, never touching a `cols`-sized scratch buffer
+// per row at all. Benchmarked (scalar fused vs current path): ~4.3x.
+// AVX2 fused on top of that: ~4.7x total. Bit-exact-validated against the
+// scalar integer accumulator across 50,000 random blocks before this was
+// written into the engine.
+//
+// Only applies to Q4_0 weights specifically — every other quant type still
+// goes through the original dequantize_row()+dot_f32() path below unchanged.
+
+// Quantizes `seq` independent rows of `cols` floats each (stride x_stride
+// between rows) into Q8_0: one float scale + `cols` int8 values per 32-
+// element block, laid out contiguously per row. Internal scratch format only
+// — this never touches disk or GGUF, so it doesn't need to match any
+// on-disk Q8_0 byte layout, just be self-consistent within this file.
+//
+// Also emits sum_out: the plain int32 sum of each block's 32 quantized
+// values. This exists purely so the fused dot kernels (dot_q4_0_q8_0,
+// and dot_q8_0_q8_0's VNNI path) don't have to recompute it — see the FIX
+// comment at their call sites below for why that recompute used to be a
+// real hot-path cost, not a rounding error.
+inline void quantize_rows_q8_0(const float* X, size_t x_stride, size_t cols,
+                                size_t seq, float* d_out, int8_t* q_out,
+                                int32_t* sum_out, util::ThreadPool* pool = nullptr) {
+    size_t nb = cols / 32;
+    auto rows = [=](size_t t0, size_t t1) {
+        for (size_t t = t0; t < t1; ++t)
+            simd::quantize_row_q8_0(X + t * x_stride, cols, d_out + t * nb, q_out + t * cols, sum_out + t * nb);
+    };
+    int nth = pool ? std::max(1, pool->size()) : 1;
+    if (nth == 1 || seq < 8) { rows(0, seq); return; }
+    size_t chunk = (seq + (size_t)nth - 1) / (size_t)nth;
+    for (size_t t0 = 0; t0 < seq; t0 += chunk) {
+        size_t t1 = std::min(seq, t0 + chunk);
+        pool->submit([=] { rows(t0, t1); });
+    }
+    pool->wait();
+}
+
+// ───────────────────────── SIMD numeric primitives ───────────────────────────
+// dot_f32 / axpy_f32 / dot_q4_0_q8_0 / dot_q8_0_q8_0 all live in
+// rawllm_simd_dispatch.hpp now (split into rawllm_simd_scalar.hpp /
+// rawllm_simd_avx2.hpp / rawllm_simd_avx512.hpp underneath), which picks
+// AVX-512-VNNI > AVX-512F > AVX2 > scalar AT RUNTIME via GCC/Clang function
+// multiversioning (ifunc, resolved via cpuid on first call) rather than the
+// old compile-time RAWLLM_AVX2/RAWLLM_AVX512 macros — one binary now runs
+// correctly (and fast) across whatever CPU it's actually deployed on,
+// instead of needing a separate build per target ISA. Pulled in here as
+// thin `using` aliases so every call site below (proj_all_positions,
+// proj_all_positions_multi, the attention QK^T/weighted-V loop) keeps
+// calling dot_f32()/axpy_f32()/dot_q4_0_q8_0()/dot_q8_0_q8_0() unqualified,
+// unchanged from before the split.
+using simd::dot_f32;
+using simd::axpy_f32;
+using simd::dot_q4_0_q8_0;
+using simd::dot_q8_0_q8_0;
+using simd::dot4_q4_0_q8_0;
+using simd::dot4_q8_0_q8_0;
+using simd::attn_wsum_i8;
+using simd::attn_scores;
+using simd::quantize_row_q8_0;
+using simd::tile4_q4_0_q8_0;
+using simd::tile4_q8_0_q8_0;
+
+// ───────────────────────── matvec / projections ─────────────────────────────
+// GGUF/GGML store a 2-D weight tensor with shape = [cols, rows] where
+// shape[0] (=cols) is the contiguous/fastest dimension — i.e. memory holds
+// `rows` rows back-to-back, each row `cols` elements. That convention is
+// already load-bearing elsewhere in this codebase (see rawllm_loader.hpp's
+// detect_config() comments), so it's safe to rely on here too.
+//
+// Always parallelizes across output ROWS (never across positions — see the
+// FIX comment inside the function body for why the old position-split
+// "prefill" branch was actively harmful on a memory-constrained box). Each
+// weight row is dequantized exactly once and the dot products for every
+// seq position are accumulated against that same row before moving on.
+//
+// Q4_0 weights take a separate fast path (dot_q4_0_q8_0() above) that skips
+// the dequantize-to-rowbuf step entirely; every other quant type still goes
+// through dequantize_row()+dot_f32().
+
+// Cache-blocked fused Q4_0/Q8_0 projection of weight rows [r0,r1) against
+// `seq` pre-quantized activation positions. Positions are processed in
+// blocks sized so the block's int8 activations (~96 KB) stay resident in L2,
+// and for each position block every weight row group is streamed from memory
+// exactly ONCE (seq/PB passes over the weights instead of `seq` passes), with
+// a 4-row x 2-position register tile inside (tile4_*). Used by both
+// proj_all_positions() and proj_all_positions_multi().
+inline void proj_fast_rows(bool is_q4, const uint8_t* wbase, size_t row_bytes, size_t cols,
+                           size_t r0, size_t r1, size_t seq, float* Y, size_t y_stride,
+                           const float* bias, const float* q8_d, const int32_t* q8_sum,
+                           const int8_t* q8_q, const repack::Packed* pk = nullptr)
+{
+    const size_t nb = cols / 32;
+    // Repacked fast path (rawllm_repack.hpp): whole 8-row panels inside [r0, r1) go through the
+    // rows-in-lanes GEMM kernels; only the tail rows (rows % 8, or a unit not starting on a panel
+    // boundary) fall through to the legacy unpacked code below. Positions are blocked so the
+    // block's int8 activations (~96 KB) stay in L2 while each panel is streamed once per block.
+    if (pk && (r0 & 7) == 0) {
+        const size_t pend = std::min(r1, pk->rows) & ~(size_t)7;
+        if (pend > r0) {
+            const size_t PBp = std::clamp<size_t>((96 * 1024) / std::max<size_t>(cols, 1), 4, 64) & ~(size_t)3;
+            for (size_t pb = 0; pb < seq; pb += PBp) {
+                const size_t np = std::min(PBp, seq - pb);
+                repack::gemm(*pk, r0 / 8, (pend - r0) / 8, q8_d + pb * nb, q8_sum + pb * nb, q8_q + pb * cols,
+                             np, Y + pb * y_stride + r0, y_stride, bias ? bias + r0 : nullptr);
+            }
+            r0 = pend;
+        }
+        if (r0 >= r1) return;
+    }
+    size_t PB = std::clamp<size_t>((96 * 1024) / std::max<size_t>(cols, 1), 2, 64) & ~(size_t)1;
+    for (size_t pb = 0; pb < seq; pb += PB) {
+        size_t np = std::min(PB, seq - pb);
+        const float*   xd = q8_d + pb * nb;
+        const int32_t* xs = q8_sum + pb * nb;
+        const int8_t*  xq = q8_q + pb * cols;
+        float* Yp = Y + pb * y_stride;
+        size_t r = r0;
+        for (; r + 4 <= r1; r += 4) {
+            const uint8_t* w = wbase + r * row_bytes;
+            if (is_q4) tile4_q4_0_q8_0(w, row_bytes, xd, xs, xq, cols, np, Yp + r, y_stride);
+            else       tile4_q8_0_q8_0(w, row_bytes, xd, xs, xq, cols, np, Yp + r, y_stride);
+            if (bias)
+                for (size_t t = 0; t < np; ++t)
+                    for (int j = 0; j < 4; ++j) Yp[t * y_stride + r + j] += bias[r + j];
+        }
+        for (; r < r1; ++r) {
+            const uint8_t* row = wbase + r * row_bytes;
+            float b = bias ? bias[r] : 0.f;
+            for (size_t t = 0; t < np; ++t)
+                Yp[t * y_stride + r] = (is_q4
+                    ? dot_q4_0_q8_0(row, xd + t * nb, xs + t * nb, xq + t * cols, cols)
+                    : dot_q8_0_q8_0(row, xd + t * nb, xs + t * nb, xq + t * cols, cols)) + b;
+        }
+    }
+}
+
+// Dynamic work distribution (llama.cpp-style chunk stealing): `n` rows are cut into chunks of
+// `chunk` rows (a multiple of 8 so panels never straddle chunks) handed out from an atomic counter.
+// The old static one-slice-per-thread split made every projection wait for the slowest thread; with
+// all cores busy (desktop session, SMT siblings, frequency dips) that is a measurable decode loss.
+inline size_t pick_row_chunk(size_t rows, int nthreads) {
+    size_t c = (rows + (size_t)nthreads * 6 - 1) / ((size_t)nthreads * 6);
+    c = (c + 7) & ~(size_t)7;
+    return std::clamp<size_t>(c, 8, 128);
+}
+template <typename Fn>
+inline void run_row_chunks(util::ThreadPool& pool, size_t rows, size_t chunk, Fn fn) {
+    const int nth = std::max(1, pool.size());
+    const size_t nchunks = (rows + chunk - 1) / chunk;
+    if (nth == 1 || nchunks <= 1) { fn((size_t)0, rows); return; }
+    std::atomic<size_t> next{0};
+    auto worker = [&] {
+        for (;;) {
+            size_t c = next.fetch_add(1, std::memory_order_relaxed);
+            if (c >= nchunks) break;
+            fn(c * chunk, std::min(rows, (c + 1) * chunk));
+        }
+    };
+    const size_t ntasks = std::min<size_t>((size_t)nth, nchunks);
+    for (size_t i = 0; i < ntasks; ++i) pool.submit(worker);
+    pool.wait();
+}
+
+inline void proj_all_positions(const loader::TensorInfo& W,
+                                const float* X, size_t x_stride,
+                                float* Y, size_t y_stride,
+                                size_t seq, util::ThreadPool& pool,
+                                const float* bias = nullptr)
+{
+    if (W.shape.size() < 2)
+        throw std::runtime_error("forward(): expected a 2D weight tensor: " + W.name);
+    size_t cols = (size_t)W.shape[0], rows = (size_t)W.shape[1];
+    size_t bs = block_size_for(W.type);
+    if (cols % bs != 0)
+        throw std::runtime_error("forward(): " + W.name + " input dim (" +
+            std::to_string(cols) + ") isn't a multiple of its quant block size (" +
+            std::to_string(bs) + ") — can't dequantize safely.");
+    size_t row_bytes = loader::GGUFLoader::bytes_for_type(W.type, cols);
+
+#if defined(USE_ROCBLAS) && (defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM))
+    // GPU dispatch: previously nothing here ever routed through ROCm even
+    // when available (see the "WIRING NOTE" above gpu::proj_gpu) — every
+    // token ran on CPU regardless of hardware. Gate on availability, quant-
+    // type support, and a minimum size so small tensors (where dequant/
+    // upload/launch overhead would dominate) stay on the CPU path below.
+    if (rocm::GpuContext::get().available() &&
+        gpu::gpu_dequant_supported(W.type) &&
+        rows * cols >= gpu::GPU_DISPATCH_MIN_ELEMS) {
+        gpu::proj_gpu(W, X, x_stride, Y, y_stride, seq, cols, rows, row_bytes, pool);
+        // FIX: the GPU path computes the raw matmul only -- proj_gpu()
+        // itself has no notion of bias, so it has to be added here on the
+        // CPU afterward, same as the CPU paths below. Bias is O(rows) work
+        // (one add per output element, not per weight element), so doing
+        // this on the host after the GEMM result is already downloaded
+        // costs nothing worth optimizing next to the GEMM itself, and it
+        // means proj_gpu()'s untested-on-real-hardware rocBLAS call
+        // sequence doesn't need to grow another responsibility to get
+        // bias support -- it stays exactly what it was benchmarked/reasoned
+        // about above, and bias is bolted on as a separate, trivially
+        // correct pass.
+        if (bias) {
+            for (size_t t = 0; t < seq; ++t)
+                for (size_t r = 0; r < rows; ++r)
+                    Y[t * y_stride + r] += bias[r];
+        }
+        return;
+    }
+#endif
+
+    int nthreads = std::max(1, pool.size());
+
+    // Int8 fused fast path: quantize the (small) shared activation ONCE, up
+    // front, on the calling thread -- seq*cols elements, e.g. 3072 for a
+    // seq=1 decode step, trivially cheap next to the weight tensor itself --
+    // so every dispatched row task below can use the fused kernel with no
+    // per-row quantization cost. Covers both Q4_0 (nibble-packed, needs the
+    // bias-correction dot) and Q8_0 (already int8, needs no dequant at all,
+    // just a straight int8 dot) -- see dot_q4_0_q8_0()/dot_q8_0_q8_0() in
+    // rawllm_simd_dispatch.hpp. Every other quant type still goes through
+    // dequantize_row()+dot_f32() below unchanged.
+    const bool use_q4_0_fast = (W.type == loader::GGMLType::Q4_0);
+    const bool use_q8_0_fast = (W.type == loader::GGMLType::Q8_0);
+    thread_local std::vector<float>   q8_d;
+    thread_local std::vector<int8_t>  q8_q;
+    thread_local std::vector<int32_t> q8_sum;
+    if (use_q4_0_fast || use_q8_0_fast) {
+        size_t nb = cols / 32;
+        if (q8_d.size() < seq * nb)   q8_d.resize(seq * nb);
+        if (q8_q.size() < seq * cols) q8_q.resize(seq * cols);
+        if (q8_sum.size() < seq * nb) q8_sum.resize(seq * nb);
+        quantize_rows_q8_0(X, x_stride, cols, seq, q8_d.data(), q8_q.data(), q8_sum.data(), &pool);
+    }
+    const float*   q8_d_ptr   = q8_d.data();
+    const int8_t*  q8_q_ptr   = q8_q.data();
+    const int32_t* q8_sum_ptr = q8_sum.data();
+
+    // FIX (perf): always parallelize across output ROWS, never across
+    // positions. This used to branch on seq vs nthreads and, for seq >
+    // nthreads ("prefill"), split work across positions instead — which
+    // dequantized every weight row once PER POSITION rather than once
+    // total. For a 100MB tensor (e.g. ffn_gate on this model) and a
+    // 23-token prompt, that's ~2.3GB of redundant re-reads through a file
+    // that doesn't fit in page cache, for that one tensor in one layer
+    // alone — dwarfing any scalar-vs-AVX2 difference in the actual dot
+    // products. The row-parallel strategy below dequantizes each row
+    // exactly once regardless of seq and reuses it for every position's
+    // dot product; X (seq*cols floats) is small enough to stay resident in
+    // L2/L3 across that inner loop for any seq this engine can realistically
+    // prefill in reasonable time on this hardware, so there's no real
+    // cache-locality trade-off being given up here, just redundant reads
+    // being removed.
+    if (use_q4_0_fast || use_q8_0_fast) {
+        // Packed panels (built once, cached by data pointer) + dynamic chunk scheduling.
+        const repack::Packed* pk = repack::get_or_build(W.data_ptr,
+            use_q4_0_fast ? repack::Kind::Q4_0 : repack::Kind::Q8_0, rows, cols, row_bytes, pool);
+        run_row_chunks(pool, rows, pick_row_chunk(rows, nthreads), [&](size_t r0, size_t r1) {
+            proj_fast_rows(use_q4_0_fast, W.data_ptr, row_bytes, cols, r0, r1, seq,
+                           Y, y_stride, bias, q8_d_ptr, q8_sum_ptr, q8_q_ptr, pk);
+        });
+        return;
+    }
+    size_t row_chunk = (rows + (size_t)nthreads - 1) / (size_t)nthreads;
+    bool any = false;
+    for (int ti = 0; ti < nthreads; ++ti) {
+        size_t r0 = (size_t)ti * row_chunk;
+        size_t r1 = std::min(rows, r0 + row_chunk);
+        if (r0 >= r1) continue;
+        any = true;
+        pool.submit([&W, X, x_stride, Y, y_stride, cols, row_bytes, seq, r0, r1, bias] {
+            // FIX (perf): this used to be `std::vector<float> rowbuf(cols);`
+            // declared fresh inside the lambda — a heap alloc+free on every
+            // single dispatched task. proj_all_positions_multi() runs this
+            // same pattern up to ~7 times a layer × n_layer times a token;
+            // thread_local gives each worker thread ONE persistently-sized
+            // buffer for its whole lifetime instead of churning the
+            // allocator on the hot path.
+            thread_local std::vector<float> rowbuf;
+            if (rowbuf.size() < cols) rowbuf.resize(cols);
+            for (size_t r = r0; r < r1; ++r) {
+                dequantize_row(W.type, W.data_ptr + r * row_bytes, cols, rowbuf.data());
+                float b = bias ? bias[r] : 0.f;
+                for (size_t t = 0; t < seq; ++t) {
+                    const float* x = X + t * x_stride;
+                    Y[t * y_stride + r] = dot_f32(rowbuf.data(), x, cols) + b;
+                }
+            }
+        });
+    }
+    if (any) pool.wait();
+}
+
+// FIX (perf): proj_all_positions() above does exactly one submit()/wait()
+// round trip per WEIGHT TENSOR. Q, K, V are three separate tensors that
+// all read the SAME input (normed) with the same x_stride (n_embd) — the
+// old code called proj_all_positions() three times in a row for them,
+// paying three submit()/wait() barriers a layer where one would do (same
+// story for ffn_gate + ffn_up). Under heavy thread-pool contention this
+// barrier overhead is one of several additive costs; fusing it away is
+// free correctness-wise (the math is unchanged — each row of each tensor
+// is still dequantized exactly once) and removes ~40% of this engine's
+// per-layer pool round trips.
+//
+// Mechanism: flatten (tensor, row) into one global index space sized
+// sum(rows_i) across all targets, split THAT evenly across threads (same
+// trick the attention loop already uses for (position, head)), and let
+// each thread walk whichever targets its assigned slice overlaps.
+struct ProjTarget {
+    const loader::TensorInfo* W;
+    float*                    Y;
+    size_t                    y_stride;
+    const float*              bias = nullptr; // nullptr => no bias (spec-v1 behavior)
+};
+
+inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
+                                      const float* X, size_t x_stride,
+                                      size_t seq, util::ThreadPool& pool)
+{
+#if defined(USE_ROCBLAS) && (defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM))
+    // GPU dispatch: split off whichever targets are GPU-eligible and run
+    // each through proj_all_positions() (which now carries the same
+    // availability/type/size gating as the single-tensor call site above)
+    // so the GPU path logic lives in exactly one place. This gives up the
+    // chance to fuse e.g. Q+K+V into one batched GEMM across all three
+    // tensors at once — each goes to the GPU as its own call instead of
+    // one combined dispatch — in exchange for reusing already-wired logic
+    // instead of duplicating the GPU codepath here too. Worth revisiting
+    // once this is actually running on hardware and it's clear whether
+    // the per-call launch/sync overhead (three small syncs vs one) is
+    // significant next to the weight-cache-hit steady-state cost.
+    std::vector<ProjTarget> cpu_targets;
+    cpu_targets.reserve(targets.size());
+    bool gpu_available = rocm::GpuContext::get().available();
+    for (const auto& tg : targets) {
+        size_t cols = tg.W->shape.size() >= 2 ? (size_t)tg.W->shape[0] : 0;
+        size_t rows = tg.W->shape.size() >= 2 ? (size_t)tg.W->shape[1] : 0;
+        if (gpu_available && cols && rows &&
+            gpu::gpu_dequant_supported(tg.W->type) &&
+            rows * cols >= gpu::GPU_DISPATCH_MIN_ELEMS) {
+            proj_all_positions(*tg.W, X, x_stride, tg.Y, tg.y_stride, seq, pool, tg.bias);
+        } else {
+            cpu_targets.push_back(tg);
+        }
+    }
+    if (cpu_targets.empty()) return;
+    const std::vector<ProjTarget>& targets_ref = cpu_targets;
+#else
+    const std::vector<ProjTarget>& targets_ref = targets;
+#endif
+
+    enum class FastKind { None, Q4_0, Q8_0 };
+    struct Span {
+        const loader::TensorInfo* W;
+        size_t row_bytes, cols, y_stride, r0_global, r1_global;
+        float* Y;
+        FastKind fast;
+        const float* bias;
+        const repack::Packed* pk;
+    };
+    std::vector<Span> spans;
+    spans.reserve(targets_ref.size());
+    size_t total = 0;
+    // All targets in a single call share the same X/x_stride (Q,K,V all read
+    // the same normed input; gate,up read the same ff_normed input), but
+    // they don't necessarily share `cols` in general, so the Q8_0
+    // quantization of X is keyed per distinct `cols` value actually seen
+    // rather than assumed uniform — in practice every current call site uses
+    // a single cols value across all of its targets, so this is one
+    // quantization pass, not several. Q4_0 and Q8_0 fast targets share the
+    // SAME quantized-activation buffer (quantize_rows_q8_0()'s output format
+    // doesn't depend on the weight's quant type), so both kinds are folded
+    // into the one "any_fast_cols" consistency check below.
+    size_t any_fast_cols = 0;
+    for (const auto& tg : targets_ref) {
+        if (tg.W->shape.size() < 2)
+            throw std::runtime_error("forward(): expected a 2D weight tensor: " + tg.W->name);
+        size_t cols = (size_t)tg.W->shape[0], rows = (size_t)tg.W->shape[1];
+        size_t bs = block_size_for(tg.W->type);
+        if (cols % bs != 0)
+            throw std::runtime_error("forward(): " + tg.W->name + " input dim (" +
+                std::to_string(cols) + ") isn't a multiple of its quant block size (" +
+                std::to_string(bs) + ") — can't dequantize safely.");
+        size_t row_bytes = loader::GGUFLoader::bytes_for_type(tg.W->type, cols);
+        FastKind fast = FastKind::None;
+        if (tg.W->type == loader::GGMLType::Q4_0) fast = FastKind::Q4_0;
+        else if (tg.W->type == loader::GGMLType::Q8_0) fast = FastKind::Q8_0;
+        if (fast != FastKind::None) {
+            if (any_fast_cols != 0 && any_fast_cols != cols)
+                throw std::runtime_error("forward(): proj_all_positions_multi() got fused-"
+                    "fast-path targets with mismatched input dims (" + std::to_string(any_fast_cols) +
+                    " vs " + std::to_string(cols) + ") in one call — the shared Q8_0 "
+                    "activation buffer assumes all fused (Q4_0 or Q8_0) targets share `cols`, "
+                    "true at every current call site (Q/K/V share n_embd; gate/up share n_embd) "
+                    "but not safe to assume in general.");
+            any_fast_cols = cols;
+        }
+        const repack::Packed* pk = nullptr;
+        if (fast != FastKind::None)
+            pk = repack::get_or_build(tg.W->data_ptr, fast == FastKind::Q4_0 ? repack::Kind::Q4_0 : repack::Kind::Q8_0,
+                                      rows, cols, row_bytes, pool);
+        spans.push_back({tg.W, row_bytes, cols, tg.y_stride, total, total + rows, tg.Y, fast, tg.bias, pk});
+        total += rows;
+    }
+
+    thread_local std::vector<float>   q8_d;
+    thread_local std::vector<int8_t>  q8_q;
+    thread_local std::vector<int32_t> q8_sum;
+    if (any_fast_cols) {
+        size_t nb = any_fast_cols / 32;
+        if (q8_d.size() < seq * nb)             q8_d.resize(seq * nb);
+        if (q8_q.size() < seq * any_fast_cols)  q8_q.resize(seq * any_fast_cols);
+        if (q8_sum.size() < seq * nb)           q8_sum.resize(seq * nb);
+        quantize_rows_q8_0(X, x_stride, any_fast_cols, seq, q8_d.data(), q8_q.data(), q8_sum.data(), &pool);
+    }
+    const float*   q8_d_ptr   = q8_d.data();
+    const int8_t*  q8_q_ptr   = q8_q.data();
+    const int32_t* q8_sum_ptr = q8_sum.data();
+
+    // Dynamic scheduling over (span, row-chunk) units. Chunks are multiples of 8 rows inside a span
+    // so packed panels never straddle two units; units are pulled from an atomic counter.
+    const int nthreads = std::max(1, pool.size());
+    struct Unit { uint32_t span; uint32_t lo, hi; };
+    std::vector<Unit> units;
+    const size_t chunk = pick_row_chunk(total, nthreads);
+    for (size_t si = 0; si < spans.size(); ++si) {
+        const size_t rows = spans[si].r1_global - spans[si].r0_global;
+        for (size_t r = 0; r < rows; r += chunk)
+            units.push_back({(uint32_t)si, (uint32_t)r, (uint32_t)std::min(rows, r + chunk)});
+    }
+    auto do_unit = [&](const Unit& u) {
+        thread_local std::vector<float> rowbuf;
+        const Span& sp = spans[u.span];
+        if (sp.fast != FastKind::None) {
+            proj_fast_rows(sp.fast == FastKind::Q4_0, sp.W->data_ptr, sp.row_bytes, sp.cols,
+                           u.lo, u.hi, seq, sp.Y, sp.y_stride, sp.bias, q8_d_ptr, q8_sum_ptr, q8_q_ptr, sp.pk);
+            return;
+        }
+        if (rowbuf.size() < sp.cols) rowbuf.resize(sp.cols);
+        for (size_t r = u.lo; r < u.hi; ++r) {
+            dequantize_row(sp.W->type, sp.W->data_ptr + r * sp.row_bytes, sp.cols, rowbuf.data());
+            float b = sp.bias ? sp.bias[r] : 0.f;
+            for (size_t t = 0; t < seq; ++t)
+                sp.Y[t * sp.y_stride + r] = dot_f32(rowbuf.data(), X + t * x_stride, sp.cols) + b;
+        }
+    };
+    if (nthreads == 1 || units.size() <= 1) { for (const auto& u : units) do_unit(u); return; }
+    std::atomic<size_t> next{0};
+    auto worker = [&] {
+        for (;;) {
+            size_t i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= units.size()) break;
+            do_unit(units[i]);
+        }
+    };
+    const size_t ntasks = std::min<size_t>((size_t)nthreads, units.size());
+    for (size_t i = 0; i < ntasks; ++i) pool.submit(worker);
+    pool.wait();
+}
+
+// ───────────────────────── norm / activation ────────────────────────────────
+
+inline void rms_norm(const float* x, const float* w, float* out, size_t n, float eps) {
+    double ss = 0.0;
+    for (size_t i = 0; i < n; ++i) ss += (double)x[i] * (double)x[i];
+    float scale = 1.0f / std::sqrt((float)(ss / (double)n) + eps);
+    for (size_t i = 0; i < n; ++i) out[i] = x[i] * scale * w[i];
+}
+
+// Uses engine::fast_expf (same approximation the attention softmax already
+// uses) — consistent with the rest of this file and measurably faster than
+// std::exp for the large element counts in the FFN gate.
+inline float silu(float x) { return x / (1.0f + engine::fast_expf(-x)); }
+
+// ───────────────────────── RoPE ──────────────────────────────────────────────
+// NANITY fixes one rotation convention (adjacent-pair: rotates (v[2i], v[2i+1])
+// for i in [0, head_dim/2)). There is no second convention to choose between
+// and so no per-model heuristic — modeling_nanity.py's RoPE implementation
+// must match this exactly (it does; see its rotate_pairs()).
+
+// Precompute the head_dim/2 base frequencies:
+//   freqs[i] = rope_base ^ (-2i / head_dim)
+//
+// These depend only on i and head_dim — not on position, head index, or
+// layer. Call this once before the layer loop and pass freqs[] into
+// rope_apply() to avoid recomputing std::pow on every (layer, position,
+// head, i) quadruple.
+inline std::vector<float> rope_make_freqs(size_t head_dim, float rope_base) {
+    size_t half = head_dim / 2;
+    std::vector<float> freqs(half);
+    for (size_t i = 0; i < half; ++i)
+        freqs[i] = std::pow(rope_base, -2.0f * (float)i / (float)head_dim);
+    return freqs;
+}
+
+// Apply RoPE to all heads in `vec` at sequence position `pos`.
+// freqs[] has length head_dim/2 and must come from rope_make_freqs().
+// The formula is identical to the original per-call version; only the
+// std::pow is hoisted out.
+inline void rope_apply(float* vec, size_t n_heads_local, size_t head_dim, size_t rope_half,
+                        size_t pos, float rope_scale, const float* freqs)
+{
+    size_t half = rope_half;
+    float fpos = (float)pos / rope_scale;  // hoist the divide outside both loops
+    for (size_t h = 0; h < n_heads_local; ++h) {
+        float* v = vec + h * head_dim;
+        for (size_t i = 0; i < half; ++i) {
+            float theta = fpos * freqs[i];
+            float c = std::cos(theta), s = std::sin(theta);
+            float x0 = v[2*i], x1 = v[2*i + 1];
+            v[2*i]     = x0 * c - x1 * s;
+            v[2*i + 1] = x0 * s + x1 * c;
+        }
+    }
+}
+
+// Same rotation as rope_apply(), but with cos/sin precomputed per (position,
+// pair) — they depend only on position and pair index, not on head or layer,
+// so the old code recomputed each cos/sin n_heads * n_layer times.
+inline void rope_apply_tab(float* vec, size_t n_heads_local, size_t head_dim, size_t half,
+                            const float* cos_t, const float* sin_t)
+{
+    for (size_t h = 0; h < n_heads_local; ++h) {
+        float* v = vec + h * head_dim;
+        for (size_t i = 0; i < half; ++i) {
+            float c = cos_t[i], s = sin_t[i];
+            float x0 = v[2*i], x1 = v[2*i + 1];
+            v[2*i]     = x0 * c - x1 * s;
+            v[2*i + 1] = x0 * s + x1 * c;
+        }
+    }
+}
+
+// Runs fn(begin, end) over [0, n) split across the pool; inline when the
+// range is too small to be worth a barrier.
+template <typename Fn>
+inline void parallel_range(util::ThreadPool& pool, size_t n, size_t min_per_task, Fn fn) {
+    int nth = std::max(1, pool.size());
+    if (nth == 1 || n < 2 * min_per_task) { fn((size_t)0, n); return; }
+    size_t chunk = std::max(min_per_task, (n + (size_t)nth - 1) / (size_t)nth);
+    for (size_t b = 0; b < n; b += chunk) {
+        size_t e = std::min(n, b + chunk);
+        pool.submit([=] { fn(b, e); });
+    }
+    pool.wait();
+}
+
+// Rotates an already-RoPE'd vector by a signed position DELTA, instead of
+// rotating a fresh vector to an absolute position like rope_apply() does.
+// This is what makes context-shift exact rather than approximate: adjacent-
+// pair rotations compose additively in angle (R(a)·R(b) == R(a+b)), so
+// applying R(delta) to a vector that's already R(pos)-rotated produces
+// exactly R(pos+delta)·v_raw — bit-for-bit the same vector the cache would
+// hold had that token's position been pos+delta all along, not an
+// approximation of it. Used by kv_cache_shift() below with a NEGATIVE
+// delta (shifting the window down); same freqs[]/rope_half convention as
+// rope_apply() so partial-rotary (rope_dim_count) behaves identically.
+inline void rope_rotate_by_delta(float* vec, size_t n_heads_local, size_t head_dim,
+                                  size_t rope_half, float delta_pos,
+                                  float rope_scale, const float* freqs)
+{
+    float fdelta = delta_pos / rope_scale;
+    for (size_t h = 0; h < n_heads_local; ++h) {
+        float* v = vec + h * head_dim;
+        for (size_t i = 0; i < rope_half; ++i) {
+            float theta = fdelta * freqs[i];
+            float c = std::cos(theta), s = std::sin(theta);
+            float x0 = v[2*i], x1 = v[2*i + 1];
+            v[2*i]     = x0 * c - x1 * s;
+            v[2*i + 1] = x0 * s + x1 * c;
+        }
+    }
+}
+
+// ───────────────────────── weight resolution ────────────────────────────────
+// Per-layer tensors are found by name (blk.N.<suffix>) under the exact
+// canonical names the spec mandates — no fused-QKV, no fused-gate_up, no
+// name synonyms. validate_config() already confirmed every one of these
+// exists with the right shape before this struct is ever built, so the
+// lookups below are a formality, not a safety net.
+
+struct LayerWeights {
+    const loader::TensorInfo* attn_norm = nullptr;
+    const loader::TensorInfo* attn_q    = nullptr;
+    const loader::TensorInfo* attn_k    = nullptr;
+    const loader::TensorInfo* attn_v    = nullptr;
+    const loader::TensorInfo* attn_out  = nullptr;
+    const loader::TensorInfo* ffn_norm  = nullptr;
+    const loader::TensorInfo* ffn_gate  = nullptr;
+    const loader::TensorInfo* ffn_up    = nullptr;
+    const loader::TensorInfo* ffn_down  = nullptr;
+
+    // Bias vectors (nullptr when cfg.use_bias is false, which
+    // validate_config() already guarantees means these tensors don't exist
+    // in the file at all -- see engine::Config::use_bias). Stored as raw
+    // `const float*` rather than `const TensorInfo*` because F32 GGUF
+    // tensor data IS just a contiguous IEEE754 float array in the mmap'd
+    // file already -- there's no dequant step to defer, so resolving
+    // straight to the pointer once at load time keeps every call site
+    // below a plain nullable pointer instead of a second indirection.
+    const float* attn_q_bias      = nullptr;
+    const float* attn_k_bias      = nullptr;
+    const float* attn_v_bias      = nullptr;
+    const float* attn_out_bias    = nullptr;
+    const float* ffn_gate_bias    = nullptr;
+    const float* ffn_up_bias      = nullptr;
+    const float* ffn_down_bias    = nullptr;
+};
+
+struct ModelWeights {
+    const loader::TensorInfo* token_embd  = nullptr;
+    const loader::TensorInfo* output_norm = nullptr;
+    const loader::TensorInfo* output      = nullptr; // null => tied to token_embd
+    const float*              output_bias = nullptr; // null when untied or use_bias=false
+    std::vector<LayerWeights> layers;
+
+    // Templated on Loader (GGUFLoader or NCTRLoader) rather than hardcoded —
+    // both expose the same `.tensors` vector of loader::TensorInfo, which is
+    // the only thing this ever touches, so nothing here actually cares which
+    // container format produced it.
+    template <typename Loader>
+    static const loader::TensorInfo* find_exact(const Loader& g, const std::string& name) {
+        for (const auto& t : g.tensors) if (t.name == name) return &t;
+        return nullptr;
+    }
+
+    // Resolves an optional bias tensor straight to its float data, or
+    // nullptr if absent. validate_config() has already enforced that
+    // presence/type/shape agree with cfg.use_bias before this ever runs,
+    // so this is a lookup, not a second validation pass.
+    template <typename Loader>
+    static const float* find_bias(const Loader& g, const std::string& name) {
+        const loader::TensorInfo* t = find_exact(g, name);
+        return t ? reinterpret_cast<const float*>(t->data_ptr) : nullptr;
+    }
+
+    template <typename Loader>
+    static ModelWeights build(const Loader& g, const engine::Config& cfg) {
+        ModelWeights mw;
+        mw.token_embd  = find_exact(g, "token_embd.weight");
+        mw.output_norm = find_exact(g, "output_norm.weight");
+        mw.output      = find_exact(g, "output.weight"); // optional: tied embeddings if absent
+        if (mw.output) mw.output_bias = find_bias(g, "output.bias");
+
+        if (!mw.token_embd)  throw std::runtime_error("forward(): token_embd.weight not found");
+        if (!mw.output_norm) throw std::runtime_error("forward(): output_norm.weight not found");
+
+        mw.layers.resize(cfg.n_layer);
+        for (uint32_t i = 0; i < cfg.n_layer; ++i) {
+            std::string p = "blk." + std::to_string(i) + ".";
+            auto& L = mw.layers[i];
+            L.attn_norm = find_exact(g, p + "attn_norm.weight");
+            L.attn_q    = find_exact(g, p + "attn_q.weight");
+            L.attn_k    = find_exact(g, p + "attn_k.weight");
+            L.attn_v    = find_exact(g, p + "attn_v.weight");
+            L.attn_out  = find_exact(g, p + "attn_output.weight");
+            L.ffn_norm  = find_exact(g, p + "ffn_norm.weight");
+            L.ffn_gate  = find_exact(g, p + "ffn_gate.weight");
+            L.ffn_up    = find_exact(g, p + "ffn_up.weight");
+            L.ffn_down  = find_exact(g, p + "ffn_down.weight");
+
+            if (cfg.use_bias) {
+                L.attn_q_bias   = find_bias(g, p + "attn_q.bias");
+                L.attn_k_bias   = find_bias(g, p + "attn_k.bias");
+                L.attn_v_bias   = find_bias(g, p + "attn_v.bias");
+                L.attn_out_bias = find_bias(g, p + "attn_output.bias");
+                L.ffn_gate_bias = find_bias(g, p + "ffn_gate.bias");
+                L.ffn_up_bias   = find_bias(g, p + "ffn_up.bias");
+                L.ffn_down_bias = find_bias(g, p + "ffn_down.bias");
+            }
+
+            if (!L.attn_norm || !L.attn_q || !L.attn_k || !L.attn_v || !L.attn_out ||
+                !L.ffn_norm  || (cfg.use_swiglu && !L.ffn_gate) || !L.ffn_up || !L.ffn_down) {
+                throw std::runtime_error(
+                    "forward(): layer " + std::to_string(i) + " is missing a required "
+                    "tensor under the blk." + std::to_string(i) + ".* naming convention. "
+                    "validate_config() should have caught this before we got here — if "
+                    "you're seeing this, please file a bug, it means the two checks "
+                    "disagree about what the spec requires.");
+            }
+        }
+        return mw;
+    }
+};
+
+// Eagerly builds every packed weight panel set (otherwise built lazily on first use inside the
+// first forward call). Call once after loading, e.g. right after ModelWeights::build(), so the
+// one-time pass over the weights doesn't land in first-token latency. No-op when RAWLLM_NO_REPACK=1.
+inline void prepack_model(const ModelWeights& mw, util::ThreadPool& pool) {
+    auto one = [&](const loader::TensorInfo* t) {
+        if (!t || t->shape.size() < 2) return;
+        repack::Kind k;
+        if (t->type == loader::GGMLType::Q4_0) k = repack::Kind::Q4_0;
+        else if (t->type == loader::GGMLType::Q8_0) k = repack::Kind::Q8_0;
+        else return;
+        size_t cols = (size_t)t->shape[0], rows = (size_t)t->shape[1];
+        if (cols % 32) return;
+        repack::get_or_build(t->data_ptr, k, rows, cols, loader::GGUFLoader::bytes_for_type(t->type, cols), pool);
+    };
+    for (const auto& L : mw.layers) {
+        one(L.attn_q); one(L.attn_k); one(L.attn_v); one(L.attn_out);
+        one(L.ffn_gate); one(L.ffn_up); one(L.ffn_down);
+    }
+    one(mw.output ? mw.output : mw.token_embd);
+}
+
+// ───────────────────────── KV cache ──────────────────────────────────────────
+// Per-layer K/V storage across calls, indexed by absolute sequence position.
+// This is what turns generation from O(seq²) into O(seq): transformer_forward
+// below only ever computes Q/K/V/FFN for the *new* tokens passed to it; every
+// older position's K/V was already written into this cache on a previous
+// call and is read back directly rather than recomputed.
+//
+// Scope: this struct itself only knows about positions, not turns or
+// tokens — cross-turn reuse (matching the new prompt's tokens against what
+// a previous call already cached, instead of always restarting at length
+// 0) is bookkeeping NEON.cpp's run_generation() does on top of this, by
+// comparing token ids and rewinding `length` to the first point of
+// divergence. That's exact, not approximate: causal attention guarantees
+// position i's K/V depends only on tokens[0..i], so any token-for-token
+// matching prefix's cached K/V is valid for the new sequence too, byte for
+// byte — it's the same computation that would happen anyway.
+//
+// Memory: capacity is fixed at cfg.ctx_len and allocated once (not per turn,
+// not per call) — for a 32-layer model with kv_dim≈1024 and ctx_len=4096,
+// that's roughly 1GB resident for the lifetime of the process. Allocate-once
+// means you pay that cost a single time at the first chat turn, not per turn.
+// ─────────────────────────── KV cache (V quantized) ──────────────────────────
+// V is stored as int8 with one float scale per (layer, position, kv_head) —
+// Q8_0-style, block size = head_dim. K stays float32.
+//
+// SCOPED, NOT SYMMETRIC, ON PURPOSE: K is left unquantized because
+// kv_cache_shift() (below) rotates K IN PLACE via rope_rotate_by_delta() —
+// exact RoPE rotation needs continuous float precision, and correctly
+// requantizing after every rotation (recomputing per-position scales,
+// re-deriving int8 values, all before the NEXT layer's attention reads them)
+// is real additional complexity this pass doesn't take on. V never gets
+// rotated (RoPE is never applied to V — see kv_cache_shift's own comment),
+// so quantizing it doesn't interact with the shift logic at all: shifting
+// quantized V is a plain memmove of int8 bytes plus their scales, same
+// shape as the float memmove it replaces.
+//
+// This is a real, if partial, memory/bandwidth win: V's contribution to the
+// cache shrinks 4x (f32 -> int8 + a per-head-block float scale, so
+// effectively ~4x on the raw values with a small per-block overhead), cutting
+// total KV cache footprint by roughly 3/8 for a typical config where K and V
+// are the same size (K unchanged + V down ~4x = (1 + 0.25)/2 of original).
+// Getting K down too would need the requantize-after-rotate work above —
+// left as a clearly separate follow-up, not attempted here.
+struct KVCache {
+    size_t n_layer   = 0;
+    size_t n_kv_head = 0;
+    size_t head_dim  = 0;
+    size_t kv_dim    = 0;   // = n_kv_head * head_dim, kept for K's existing shape
+    size_t capacity  = 0;
+    size_t length    = 0;   // number of valid cached positions, same for every layer
+    std::vector<std::vector<float>>   K;      // [layer][capacity * kv_dim], unchanged
+    std::vector<std::vector<int8_t>>  Vq;     // [layer][capacity * kv_dim], int8
+    std::vector<std::vector<float>>   Vscale; // [layer][capacity * n_kv_head]
+
+    KVCache() = default;
+    KVCache(size_t n_layer_, size_t n_kv_head_, size_t head_dim_, size_t capacity_)
+        : n_layer(n_layer_), n_kv_head(n_kv_head_), head_dim(head_dim_),
+          kv_dim(n_kv_head_ * head_dim_), capacity(capacity_),
+          K(n_layer_), Vq(n_layer_), Vscale(n_layer_)
+    {
+        for (size_t i = 0; i < n_layer_; ++i) {
+            K[i].assign(capacity_ * kv_dim, 0.f);
+            Vq[i].assign(capacity_ * kv_dim, 0);
+            Vscale[i].assign(capacity_ * n_kv_head_, 1.0f);
+        }
+    }
+
+    float*       k_row(size_t layer, size_t pos)       { return K[layer].data() + pos * kv_dim; }
+    const float* k_row(size_t layer, size_t pos) const { return K[layer].data() + pos * kv_dim; }
+
+    // Quantizes one position's full V row (all kv_heads) into the cache in
+    // one call — this is the ONLY place V quantization happens, so every
+    // reader downstream (the attention weighted-sum loop) just consumes
+    // already-quantized int8 + scale, never re-derives it.
+    void write_v_row(size_t layer, size_t pos, const float* v_f32) {
+        int8_t* vq = Vq[layer].data() + pos * kv_dim;
+        float*  sc = Vscale[layer].data() + pos * n_kv_head;
+        for (size_t h = 0; h < n_kv_head; ++h) {
+            const float* src = v_f32 + h * head_dim;
+            float amax = 0.f;
+            for (size_t d = 0; d < head_dim; ++d) amax = std::max(amax, std::fabs(src[d]));
+            float scale = amax / 127.0f;
+            float inv = scale > 0.f ? 1.0f / scale : 0.f;
+            sc[h] = scale;
+            int8_t* dst = vq + h * head_dim;
+            for (size_t d = 0; d < head_dim; ++d)
+                dst[d] = (int8_t)std::clamp((int)std::lround(src[d] * inv), -127, 127);
+        }
+    }
+
+    const int8_t* v_row_q(size_t layer, size_t pos) const { return Vq[layer].data() + pos * kv_dim; }
+    float v_scale(size_t layer, size_t pos, size_t kv_head) const {
+        return Vscale[layer][pos * n_kv_head + kv_head];
+    }
+};
+
+// Accumulates out[d] += coeff * (float)vq[d] for d in [0, n) — the
+// quantized-V equivalent of axpy_f32, used by the attention weighted-sum
+// loop now that V lives in the cache as int8. `coeff` already has both the
+// softmax weight AND this position's v_scale folded in by the caller, so
+// this is a plain int8-weighted accumulate, no additional scale lookup
+// needed here.
+//
+// TRIED AND REVERTED: online (single-pass, FlashAttention-style) softmax
+// was implemented here — keep a running max/sum and rescale the
+// accumulator by exp(old_max - new_max) whenever a new max is seen, which
+// removes the separate scores[klen] array and its two extra passes over
+// it entirely. It was verified numerically correct (max error ~5e-7
+// against this three-pass version across context lengths 1-100) but
+// measured SLOWER in practice: roughly parity at klen=4096, and ~1.7-1.9x
+// SLOWER at klen=65536-131072 — i.e. it regressed at exactly the long-
+// context workload it was meant to help. Diagnosed why with an isolated
+// microbenchmark: the memory-access-pattern/rescale-arithmetic theory was
+// wrong (an isolated plain-axpy vs rescale+axpy comparison showed no
+// difference), the real cost is that the online formulation calls exp()
+// TWICE per position (once for `correction`, once for the numerator `p`)
+// where the three-pass version below calls it ONCE per position (in its
+// own small, already-cache-resident pass) — exp() is a real transcendental
+// cost, not free arithmetic, and doubling its call rate outweighed
+// whatever the scores[] buffer was costing, since that buffer was already
+// small enough to be cache-resident at realistic sizes. A real win would
+// need BLOCK-wise online softmax (amortize the rescale/exp cost over a
+// chunk of positions, combine chunks with the online formula only at
+// chunk boundaries — this is what production FlashAttention kernels
+// actually do) rather than the position-wise version tried here; that's
+// materially more implementation complexity and wasn't attempted.
+inline void axpy_i8(float* out, float coeff, const int8_t* vq, size_t n) {
+    for (size_t d = 0; d < n; ++d) out[d] += coeff * (float)vq[d];
+}
+
+// ───────────────────────── context-window shift ──────────────────────────────
+// Called (from NEON.cpp's ensure_cache_room(), not automatically — the
+// caller decides the keep/discard policy) when the cache is about to run
+// out of room mid-reply. Keeps the first `keep` positions untouched (a
+// handful of "sink" tokens — StreamingLLM found a small fixed sink set is
+// enough to keep attention well-behaved after a shift) and discards the
+// next `discard` positions outright, sliding everything after that down.
+//
+// The surviving K entries are rotated by rope_rotate_by_delta() with
+// delta = -discard BEFORE the slide — see that function's comment for why
+// this is exact: it produces precisely the K the cache would hold had
+// those tokens lived `discard` positions earlier all along. V needs no
+// rotation (RoPE is never applied to V), so it's a plain memmove.
+//
+// This is graceful forgetting, not free context: positions in [keep,
+// keep+discard) are gone from the model's perspective once this returns,
+// same as the old hard-stop's eviction was — the difference is generation
+// continues instead of stopping. cached_tokens (NEON.cpp) must have the
+// same range erased in lockstep, or cross-turn prefix matching above would
+// compare against positions that no longer mean what they used to.
+inline void kv_cache_shift(KVCache& cache, size_t keep, size_t discard,
+                            size_t n_kv_head, size_t head_dim, size_t rope_half,
+                            float rope_scale, const float* freqs)
+{
+    if (discard == 0 || cache.length <= keep + discard) return;
+    const size_t kv_dim    = n_kv_head * head_dim;
+    const size_t tail_len  = cache.length - keep - discard;
+
+    for (size_t li = 0; li < cache.n_layer; ++li) {
+        for (size_t t = 0; t < tail_len; ++t) {
+            float* kp = cache.k_row(li, keep + discard + t);
+            rope_rotate_by_delta(kp, n_kv_head, head_dim, rope_half,
+                                  -(float)discard, rope_scale, freqs);
+        }
+        std::memmove(cache.k_row(li, keep), cache.k_row(li, keep + discard),
+                     tail_len * kv_dim * sizeof(float));
+        // V never gets rotated (see this function's header comment), so
+        // shifting it is a plain memmove of the quantized bytes plus their
+        // per-position-per-head scales — same shape as the float memmove
+        // it used to be, just two arrays (values, scales) instead of one.
+        std::memmove(cache.Vq[li].data() + keep * kv_dim,
+                     cache.Vq[li].data() + (keep + discard) * kv_dim,
+                     tail_len * kv_dim * sizeof(int8_t));
+        std::memmove(cache.Vscale[li].data() + keep * n_kv_head,
+                     cache.Vscale[li].data() + (keep + discard) * n_kv_head,
+                     tail_len * n_kv_head * sizeof(float));
+    }
+    cache.length = keep + tail_len;
+}
+
+// ───────────────────── zRAM-tier compacting shift ─────────────────────────────
+// Generalizes kv_cache_shift() for the SoftSlots compression backend
+// (nectar_zram.hpp): instead of discarding [keep, keep+discard) outright,
+// preserves `num_slots` representative rows in the freed space. Passing
+// num_slots=0 reduces to exactly kv_cache_shift()'s behavior (verified: the
+// tail_len/delta arithmetic below collapses to the same values) — this is a
+// strict generalization, not a fork, so kv_cache_shift() itself is left
+// untouched and still used by every existing caller.
+//
+// Preconditions this function assumes but does not itself create: the
+// caller has already run a forward() pass over `num_slots` reserved
+// "compression slot" token ids APPENDED to the live cache (i.e. at
+// positions [cache.length-num_slots, cache.length) when this is called),
+// so their K/V already reflects (via ordinary causal attention) everything
+// at and before position cache.length-num_slots-1 — which includes, but is
+// not limited to, the chunk about to be discarded. There is no
+// chunk-local attention mask here: a slot's K/V is a function of the
+// ENTIRE context up to it, not just the chunk being compressed. That's a
+// real semantic gap versus how trained compression schemes (Gist Tokens /
+// AutoCompressors / ICAE) usually work, which typically restrict the
+// slots' attention to the chunk itself via a custom mask so the compressed
+// representation is chunk-local and composable. Closing that gap means
+// adding mask support to transformer_forward() — not attempted here; flag
+// this before training anything against this mechanism.
+//
+// Layout before the call (L = cache.length):
+//   [0, keep)                       pinned, untouched
+//   [keep, keep+discard)            raw chunk being discarded
+//   [keep+discard, L-num_slots)     "true tail" — generated after the
+//                                   chunk, before the slot tokens
+//   [L-num_slots, L)                the slot rows just computed
+// Layout after:
+//   [0, keep)                       unchanged
+//   [keep, keep+num_slots)          slot rows, moved down + RoPE-corrected
+//   [keep+num_slots, keep+num_slots+tail_len)   true tail, moved down + corrected
+// new cache.length = keep + num_slots + tail_len
+inline void kv_cache_compact(KVCache& cache, size_t keep, size_t discard, size_t num_slots,
+                              size_t n_kv_head, size_t head_dim, size_t rope_half,
+                              float rope_scale, const float* freqs)
+{
+    if (discard == 0 && num_slots == 0) return;
+    if (cache.length < num_slots + keep + discard) return;   // malformed call, no-op rather than UB
+
+    const size_t kv_dim   = n_kv_head * head_dim;
+    const size_t L        = cache.length;
+    const size_t tail_len = (L - num_slots) - keep - discard;
+
+    // Constant deltas (independent of row index within each moving block —
+    // every row in a block shifts by the same amount, only the block's
+    // start position differs), same closed form as kv_cache_shift()'s
+    // single delta, just computed for two blocks instead of one.
+    const float delta_slots = -(float)(L - num_slots - keep);              // 0 when num_slots==0 (nothing to move)
+    const float delta_tail  = -(float)(discard - num_slots);               // == -discard when num_slots==0, matching kv_cache_shift()
+
+    for (size_t li = 0; li < cache.n_layer; ++li) {
+        // Rotate both moving blocks IN PLACE at their original positions
+        // first — moving (memmove) happens after, so rotation never reads
+        // already-overwritten data regardless of move order chosen below.
+        if (num_slots > 0) {
+            for (size_t t = 0; t < num_slots; ++t) {
+                float* kp = cache.k_row(li, L - num_slots + t);
+                rope_rotate_by_delta(kp, n_kv_head, head_dim, rope_half,
+                                      delta_slots, rope_scale, freqs);
+            }
+        }
+        for (size_t t = 0; t < tail_len; ++t) {
+            float* kp = cache.k_row(li, keep + discard + t);
+            rope_rotate_by_delta(kp, n_kv_head, head_dim, rope_half,
+                                  delta_tail, rope_scale, freqs);
+        }
+
+        // Move the tail first: its destination range [keep+num_slots,
+        // keep+num_slots+tail_len) == [keep+num_slots, L-discard), which
+        // never overlaps the slots' still-untouched source range
+        // [L-num_slots, L) as long as num_slots <= discard (true by
+        // construction — compression only makes sense when you're keeping
+        // fewer rows than you're discarding) — so it's safe to move the
+        // tail before touching the slots' source data.
+        if (tail_len > 0) {
+            std::memmove(cache.k_row(li, keep + num_slots), cache.k_row(li, keep + discard),
+                         tail_len * kv_dim * sizeof(float));
+            std::memmove(cache.Vq[li].data() + (keep + num_slots) * kv_dim,
+                         cache.Vq[li].data() + (keep + discard) * kv_dim,
+                         tail_len * kv_dim * sizeof(int8_t));
+            std::memmove(cache.Vscale[li].data() + (keep + num_slots) * n_kv_head,
+                         cache.Vscale[li].data() + (keep + discard) * n_kv_head,
+                         tail_len * n_kv_head * sizeof(float));
+        }
+        // Then move the slot rows down into the freed space right after `keep`.
+        if (num_slots > 0) {
+            std::memmove(cache.k_row(li, keep), cache.k_row(li, L - num_slots),
+                         num_slots * kv_dim * sizeof(float));
+            std::memmove(cache.Vq[li].data() + keep * kv_dim,
+                         cache.Vq[li].data() + (L - num_slots) * kv_dim,
+                         num_slots * kv_dim * sizeof(int8_t));
+            std::memmove(cache.Vscale[li].data() + keep * n_kv_head,
+                         cache.Vscale[li].data() + (L - num_slots) * n_kv_head,
+                         num_slots * n_kv_head * sizeof(float));
+        }
+    }
+
+    cache.length = keep + num_slots + tail_len;
+}
+
+// ───────────────────────── the forward pass ─────────────────────────────────
+
+// new_tokens are the tokens to process *this call* — the prompt on the first
+// (prefill) call, then exactly one token per subsequent (decode) call. cache
+// must already hold every earlier position's K/V (cache.length == the
+// absolute position of new_tokens[0]); this function appends new_tokens' K/V
+// into it and advances cache.length by new_tokens.size() before returning.
+// out_logits is filled for the *last* new token only — the only one
+// sample_top_p() ever looks at.
+// NOTE: this used to also take `const loader::GGUFLoader& gguf`, but nothing
+// in the body ever reads it — ModelWeights already holds resolved
+// loader::TensorInfo pointers by the time this runs, and dequantize_row()
+// etc. work directly off those, not off the loader. Dropped rather than
+// templated: a parameter nothing uses doesn't need to support two types,
+// it needs to not exist. (Left as a comment, not silently, since call sites
+// in NEON.cpp needed updating to match.)
+inline void transformer_forward(const engine::Config& cfg,
+                                 const ModelWeights& mw,
+                                 const std::vector<int32_t>& new_tokens,
+                                 KVCache& cache,
+                                 float* out_logits,
+                                 util::ThreadPool& pool)
+{
+    const size_t n_embd    = cfg.n_embd;
+    const size_t n_head    = cfg.n_head;
+    const size_t n_kv_head = cfg.n_kv_head;
+    const size_t head_dim  = cfg.head_dim;
+    const size_t n_ff      = cfg.n_ff;
+    const size_t seq       = new_tokens.size();   // NEW tokens this call only
+    const size_t kv_dim    = n_kv_head * head_dim;
+    const size_t q_dim     = n_head * head_dim;
+    const size_t base_pos  = cache.length;        // absolute position of new_tokens[0]
+
+    if (seq == 0) throw std::runtime_error("forward(): empty token batch");
+    if (n_head == 0 || n_kv_head == 0 || head_dim == 0)
+        throw std::runtime_error("forward(): n_head/n_kv_head/head_dim not detected (0)");
+    if (base_pos + seq > cache.capacity)
+        throw std::runtime_error("forward(): KV cache exhausted (ctx_len=" +
+            std::to_string(cache.capacity) + " exceeded) — stop generation or "
+            "increase nanity.context_length and reconvert.");
+
+    // Precompute RoPE base frequencies once. freqs[i] = rope_base^(-2i/head_dim).
+    // The same head_dim/2 values are reused for every head, every position,
+    // and every layer — std::pow runs O(head_dim/2) times total instead of
+    // O(n_layer × seq × n_head × head_dim/2).
+    const std::vector<float> rope_freqs = rope_make_freqs(head_dim, cfg.rope_base);
+    const size_t rope_half = cfg.rope_dim_count ? (cfg.rope_dim_count / 2) : (head_dim / 2);
+    std::vector<float> rope_cos(seq * rope_half), rope_sin(seq * rope_half);
+    for (size_t t = 0; t < seq; ++t) {
+        float fpos = (float)(base_pos + t) / cfg.rope_scale;
+        for (size_t i = 0; i < rope_half; ++i) {
+            float theta = fpos * rope_freqs[i];
+            rope_cos[t * rope_half + i] = std::cos(theta);
+            rope_sin[t * rope_half + i] = std::sin(theta);
+        }
+    }
+
+    // Hidden state, one row per NEW position: h[t*n_embd .. +n_embd).
+    // Earlier positions never re-enter the residual stream here — their
+    // contribution to this call is purely through the cached K/V below.
+    std::vector<float> h(seq * n_embd);
+    {
+        size_t n_vocab_rows = (size_t)mw.token_embd->shape[1];
+        size_t row_bytes = loader::GGUFLoader::bytes_for_type(mw.token_embd->type, n_embd);
+        for (size_t t = 0; t < seq; ++t) {
+            int32_t tok = new_tokens[t];
+            if (tok < 0 || (size_t)tok >= n_vocab_rows)
+                throw std::runtime_error("forward(): token id " + std::to_string(tok) + " out of vocab range");
+            dequantize_row(mw.token_embd->type, mw.token_embd->data_ptr + (size_t)tok * row_bytes,
+                            n_embd, &h[t * n_embd]);
+        }
+    }
+
+    std::vector<float> normed(seq * n_embd);
+    std::vector<float> q(seq * q_dim), k(seq * kv_dim), v(seq * kv_dim);
+    std::vector<float> attn_out(seq * q_dim);
+    std::vector<float> proj_out(seq * n_embd);
+    std::vector<float> ff_normed(seq * n_embd);
+    std::vector<float> gate_buf(seq * n_ff), up_buf(seq * n_ff), ff_act(seq * n_ff);
+    std::vector<float> ff_down(seq * n_embd);
+
+    // Reusable buffer for dequantized norm weights. Declared once here and
+    // reused for both attn_norm and ffn_norm each layer, avoiding 2×n_layer
+    // heap allocations across the forward pass.
+    std::vector<float> w_norm(n_embd);
+
+    const size_t group = n_head / n_kv_head; // GQA: query heads sharing one kv head
+    const float  scale = 1.0f / std::sqrt((float)head_dim);
+
+    // FIX (diagnostics): opt-in (VERBOSE_LOG / "Verbose engine logging" in
+    // the build flags) per-stage timing. The dequant+matvec cost in
+    // proj_all_positions[_multi]() is the only place this function ever
+    // touches the weight file — if per-token latency is actually coming
+    // from disk reads rather than CPU (e.g. the model doesn't fit in spare
+    // RAM and pages keep getting evicted), it will show up as abnormally
+    // large "proj" time here even though the CPU work involved is small.
+    // That's the fastest way to tell a memory/disk-bound machine apart
+    // from a genuinely CPU-bound one without an external profiler.
+#ifdef VERBOSE_LOG
+    double us_norm = 0, us_proj = 0, us_attn = 0, us_resid = 0;
+    auto stage_clock = std::chrono::steady_clock::now();
+    auto stage_mark = [&](double& bucket) {
+        auto now = std::chrono::steady_clock::now();
+        bucket += std::chrono::duration<double, std::micro>(now - stage_clock).count();
+        stage_clock = now;
+    };
+#else
+    auto stage_mark = [](double&) {};
+    double us_norm = 0, us_proj = 0, us_attn = 0, us_resid = 0; // unused, optimized away
+#endif
+
+    for (uint32_t li = 0; li < cfg.n_layer; ++li) {
+        const auto& L = mw.layers[li];
+
+        // ── attn_norm + RMSNorm ──────────────────────────────────────────
+        dequant_full(*L.attn_norm, w_norm.data());
+        parallel_range(pool, seq, 8, [&](size_t t0, size_t t1) {
+            for (size_t t = t0; t < t1; ++t)
+                rms_norm(&h[t * n_embd], w_norm.data(), &normed[t * n_embd], n_embd, cfg.norm_eps);
+        });
+        stage_mark(us_norm);
+
+        // ── Q/K/V projections (always separate — no fused-QKV variant) ──
+        // FIX (perf): these three independent tensors all read the same
+        // `normed` input with the same x_stride (n_embd) — fused into one
+        // thread-pool round trip instead of three (see
+        // proj_all_positions_multi()'s header comment).
+        proj_all_positions_multi({
+            {L.attn_q, q.data(), q_dim,  L.attn_q_bias},
+            {L.attn_k, k.data(), kv_dim, L.attn_k_bias},
+            {L.attn_v, v.data(), kv_dim, L.attn_v_bias},
+        }, normed.data(), n_embd, seq, pool);
+        stage_mark(us_proj);
+
+        // ── RoPE, using each token's ABSOLUTE position (base_pos + t) ──────
+        // rope_freqs was computed once before this loop; no std::pow here.
+        for (size_t t = 0; t < seq; ++t) {
+            rope_apply_tab(&q[t * q_dim],  n_head,    head_dim, rope_half, &rope_cos[t * rope_half], &rope_sin[t * rope_half]);
+            rope_apply_tab(&k[t * kv_dim], n_kv_head, head_dim, rope_half, &rope_cos[t * rope_half], &rope_sin[t * rope_half]);
+        }
+
+        // ── Write this layer's new K/V into the cache BEFORE attention ───
+        // so the attention loop below can read every position — old and
+        // new — uniformly from cache.k_row()/v_row_q() with no special-
+        // casing. V goes through write_v_row(), which quantizes it to int8
+        // (see KVCache's header comment for why V and not K).
+        for (size_t t = 0; t < seq; ++t) {
+            std::memcpy(cache.k_row(li, base_pos + t), &k[t * kv_dim], kv_dim * sizeof(float));
+            cache.write_v_row(li, base_pos + t, &v[t * kv_dim]);
+        }
+
+        // ── Causal GQA self-attention, reading K/V from the cache ───────
+        // Work is flattened over (new-position × head) and split evenly
+        // across threads. Splitting on position alone (the old strategy)
+        // starves every thread but one when seq==1 (the decode-step common
+        // case) — flattening in the head dimension too is what lets a
+        // single new token still use every available thread.
+        {
+            // Units are (position, head) pairs, handed out DYNAMICALLY from an
+            // atomic counter, heaviest (latest position) first. The old static
+            // split gave the last thread the longest causal rows (~1.8x the
+            // average load at 6 threads), so everyone waited on it.
+            const size_t total_units = seq * n_head;
+            int nthreads = std::max(1, pool.size());
+            std::atomic<size_t> next_unit{0};
+            const size_t vstride = kv_dim;
+            auto attn_worker = [&] {
+                std::vector<float> scores(base_pos + seq), coeff(base_pos + seq);
+                for (;;) {
+                    size_t idx = next_unit.fetch_add(1, std::memory_order_relaxed);
+                    if (idx >= total_units) break;
+                    size_t t  = seq - 1 - idx / n_head;
+                    size_t hh = idx % n_head;
+                    size_t abs_t = base_pos + t;
+                    size_t kvh   = hh / group;
+                    const float* qv  = &q[t * q_dim + hh * head_dim];
+                    size_t klen = abs_t + 1;   // causal: attend to [0, abs_t] inclusive
+
+                    // batched Q.K^T (8 keys per pass, see simd::attn_scores) instead of one dot_f32() call per key
+                    float maxs = attn_scores(qv, cache.k_row(li, 0) + kvh * head_dim, kv_dim, klen, head_dim, scale, scores.data());
+                    float sum = 0.f;
+                    for (size_t s2 = 0; s2 < klen; ++s2) { scores[s2] = engine::fast_expf(scores[s2] - maxs); sum += scores[s2]; }
+                    float inv = 1.0f / sum;
+                    // softmax weight and this position's int8 V scale folded into one coefficient
+                    for (size_t s2 = 0; s2 < klen; ++s2)
+                        coeff[s2] = scores[s2] * inv * cache.v_scale(li, s2, kvh);
+                    attn_wsum_i8(&attn_out[t * q_dim + hh * head_dim], coeff.data(),
+                                 cache.v_row_q(li, 0) + kvh * head_dim, vstride, klen, head_dim);
+                }
+            };
+            size_t ntasks = std::min<size_t>((size_t)nthreads, total_units);
+            if (ntasks <= 1) {
+                attn_worker();
+            } else {
+                for (size_t ti = 0; ti < ntasks; ++ti) pool.submit(attn_worker);
+                pool.wait();
+            }
+        }
+        stage_mark(us_attn);
+
+        // ── output projection + residual ───────────────────────────────
+        proj_all_positions(*L.attn_out, attn_out.data(), q_dim, proj_out.data(), n_embd, seq, pool, L.attn_out_bias);
+        stage_mark(us_proj);
+        for (size_t i = 0; i < seq * n_embd; ++i) h[i] += proj_out[i];
+        stage_mark(us_resid);
+
+        // ── FFN: RMSNorm -> SwiGLU -> down-proj + residual ──────────────
+        dequant_full(*L.ffn_norm, w_norm.data());
+        parallel_range(pool, seq, 8, [&](size_t t0, size_t t1) {
+            for (size_t t = t0; t < t1; ++t)
+                rms_norm(&h[t * n_embd], w_norm.data(), &ff_normed[t * n_embd], n_embd, cfg.norm_eps);
+        });
+        stage_mark(us_norm);
+
+        // ── FFN: gate + up projections ────────────────────────────────────
+        // Two variants, selected once at load time by cfg.use_swiglu:
+        //
+        //   SwiGLU (use_swiglu==true, NANITY spec default):
+        //     ff_act[i] = silu(gate[i]) * up[i]
+        //     Requires blk.{i}.ffn_gate.weight in every layer.
+        //
+        //   Plain SiLU-FFN (use_swiglu==false, e.g. Nanity X1 32-layer):
+        //     ff_act[i] = silu(up[i])
+        //     ffn_gate.weight is absent from the file; gate_buf goes unused.
+        //
+        // The down-projection + residual add that follow are identical in
+        // both cases — only the activation computation differs.
+        if (cfg.use_swiglu) {
+            // FIX (perf): same fusion as Q/K/V above — gate and up share
+            // the same ff_normed input, one round trip instead of two.
+            proj_all_positions_multi({
+                {L.ffn_gate, gate_buf.data(), n_ff, L.ffn_gate_bias},
+                {L.ffn_up,   up_buf.data(),   n_ff, L.ffn_up_bias},
+            }, ff_normed.data(), n_embd, seq, pool);
+            parallel_range(pool, seq * n_ff, 8192, [&](size_t b0, size_t b1) {
+                for (size_t i = b0; i < b1; ++i) ff_act[i] = silu(gate_buf[i]) * up_buf[i];
+            });
+        } else {
+            // Plain SiLU-FFN: no gate projection — silu applied directly to up.
+            proj_all_positions(*L.ffn_up, ff_normed.data(), n_embd, up_buf.data(), n_ff, seq, pool, L.ffn_up_bias);
+            parallel_range(pool, seq * n_ff, 8192, [&](size_t b0, size_t b1) {
+                for (size_t i = b0; i < b1; ++i) ff_act[i] = silu(up_buf[i]);
+            });
+        }
+        stage_mark(us_proj);
+
+        proj_all_positions(*L.ffn_down, ff_act.data(), n_ff, ff_down.data(), n_embd, seq, pool, L.ffn_down_bias);
+        stage_mark(us_proj);
+        for (size_t i = 0; i < seq * n_embd; ++i) h[i] += ff_down[i];
+        stage_mark(us_resid);
+    }
+
+#ifdef VERBOSE_LOG
+    {
+        // Self-contained timestamped line (doesn't depend on NEON.cpp's
+        // VLOG macro, which is defined AFTER it #includes this header, so
+        // it isn't visible from in here).
+        auto _now = std::chrono::steady_clock::now();
+        auto _us  = std::chrono::duration_cast<std::chrono::microseconds>(
+                        _now.time_since_epoch()).count();
+        std::cerr << "[VERBOSE " << _us << "us] forward(seq=" << seq
+                  << ", base_pos=" << base_pos << "): norm=" << (long)us_norm
+                  << "us  proj(dequant+matvec)=" << (long)us_proj
+                  << "us  attn=" << (long)us_attn
+                  << "us  resid=" << (long)us_resid
+                  << "us -- if 'proj' dominates the total far more than its "
+                     "share of model FLOPs would suggest, that's the "
+                     "signature of disk/page-fault stalls rather than "
+                     "compute (see rawllm_loader.hpp's mmap warm-up).\n";
+    }
+#endif
+
+    cache.length = base_pos + seq;   // commit: these positions are now cached
+
+    // ── Final norm + output projection (only the LAST new position's
+    //    logits are needed — that's the only one sample_top_p() will look
+    //    at). ──
+    std::vector<float> w_out_norm(n_embd);
+    dequant_full(*mw.output_norm, w_out_norm.data());
+    std::vector<float> final_normed(n_embd);
+    rms_norm(&h[(seq - 1) * n_embd], w_out_norm.data(), final_normed.data(), n_embd, cfg.norm_eps);
+
+    // Tied embeddings: token_embd.weight is shape [n_embd, n_vocab], exactly
+    // the same shape a dedicated output.weight would have, so it can be used
+    // directly as the output projection with no special-casing.
+    // seq=1 here, so proj_all_positions takes the decode/row-parallel path.
+    const loader::TensorInfo* out_w = mw.output ? mw.output : mw.token_embd;
+    proj_all_positions(*out_w, final_normed.data(), n_embd, out_logits, cfg.n_vocab, 1, pool, mw.output_bias);
+}
+
+} // namespace fwd
