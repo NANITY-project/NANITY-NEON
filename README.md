@@ -1,4 +1,4 @@
-# NEON — the NANITY Runtime (Beta)
+# NEON — the NANITY Runtime
 
 NEON is a from-scratch C++ inference runtime for **NANITY**, a single, fixed
 transformer architecture. It is deliberately *not* a "load any GGUF" runtime
