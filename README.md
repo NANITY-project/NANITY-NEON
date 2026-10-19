@@ -223,6 +223,15 @@ they are used by including the headers from your own program.
   </sub>
 </p>
 
+<h3>Memory &amp; Benchmark Methodology</h3>
+
+- **Host RSS (MB)** is the Resident Set Size: the amount of physical system RAM currently occupied by a process, including resident model-weight pages, runtime allocations, and buffers. It is **system RAM, not GPU VRAM**. Lower RSS means a smaller resident memory footprint; it does not directly indicate inference speed.
+- **Test conditions:** Both runtimes were tested on the same Intel Core i5-10400, using corresponding Qwen2.5-0.5B Q4_0 model files, matching prompt/output token targets, thread counts, and 5 repetitions.
+- **Build configuration:** NEON uses `-O2 -mavx2 -mfma`; llama.cpp uses a Release build with AVX2, FMA, F16C, and BMI2 enabled. Compiler settings are therefore not identical.
+- **Measurement:** Throughput is reported in tokens per second. NEON is timed through its interactive interface, while llama.cpp uses `llama-bench`.
+
+Results reflect the tested revisions, build configurations, model files, and hardware. They should not be interpreted as universal performance guarantees.
+
 ## Out of scope
 
 Two different kinds of "not here": things this project will never be, and
