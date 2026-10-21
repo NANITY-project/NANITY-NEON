@@ -356,7 +356,7 @@ written down here.
 | `tests/test_nctr_loader.cpp` | Standalone smoke test for the `.nctr` loader |
 | `docs/NANITY_ARCHITECTURE_SPEC.md` | The specification — the full technical contract |
 | `docs/VULKAN_BACKEND_NOTES.md` | Vulkan backend performance log and real-hardware (NVIDIA T4) validation results |
-| `website/nanity.html` | Project website |
+| `docs/CREDITS.md` | Inspirations and ideas taken/reimplemented from... |
 
 Project meta files at the root: [`CONTRIBUTING.md`](./CONTRIBUTING.md)
 (read before sending a pull request, especially the backend-review notes),
