@@ -283,7 +283,6 @@ written down here.
 ├── conversion/              model converters and exporters (Python)
 ├── tests/                   standalone tests
 ├── docs/                    specification and backend notes
-└── website/                 project website
 ```
 
 **`runtime/core/` — loaders and forward pass**
@@ -349,7 +348,7 @@ written down here.
 | `nanity_export_vit.py` | Exports a CLIP / SigLIP vision tower (plus optional connector) to a `nanity-vit` GGUF |
 | `nanity_export_mvae.py` | Exports a Motion VAE checkpoint (safetensors) to a `nanity-mvae` GGUF |
 
-**`tests/`, `docs/`, `website/`**
+**`tests/`, `docs/`**
 
 | File | What it is |
 |---|---|
