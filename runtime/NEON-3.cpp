@@ -27,9 +27,10 @@
 #include "backends/rawllm_rocm.hpp"
 #include "backends/rawllm_vulkan.hpp"
 #include "core/rawllm_forward.hpp"
+#include "idle_loop/nectar_vision.hpp"      // capture_frame() for "screen" images (standalone, no idle-loop deps)
+#include "multimodal/neon_multimodal.hpp"   // ViT + Motion VAE (+ nn kernels) glue
 #if defined(NANITY_ENABLE_IDLE_LOOP)
 #include "idle_loop/nectar_diskmem.hpp"
-#include "idle_loop/nectar_vision.hpp"
 #include "idle_loop/nectar_splice.hpp"
 #include "idle_loop/nectar_cot.hpp"
 #include "idle_loop/nectar_zram.hpp"
@@ -768,6 +769,75 @@ static size_t ensure_cache_room(const engine::Config& cfg, EngineState& st, size
 
 
 // =============================================================================
+// Multimodal sidecars (vision encoder + Motion VAE). Loaded once in run_model()
+// from --vision-model / --motion-model; all share the engine's ThreadPool.
+// =============================================================================
+static mm::VisionRuntime g_vision;
+static mm::MotionRuntime g_motion;
+
+struct MMArgs {
+    std::string              vision_model;
+    std::vector<std::string> motion_models;      // pose VAE and/or controller, any order
+    std::vector<std::string> images;             // single-shot: PPM paths, or "screen"
+    long                     motion_rollout = 0; // CLI: print N frames and exit
+    bool                     motion_info    = false;
+    long long                motion_seed    = -1;
+};
+static MMArgs g_mm_args;
+
+static bool read_file_bytes(const std::string& path, std::string& out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    out.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return true;
+}
+
+// spec: "screen" | file path | (b64 handled by caller)
+static bool load_image_spec(const std::string& spec, mm::EncodedImage& out, std::string& err) {
+    std::string ppm;
+    if (spec == "screen") {
+        auto fc = vision::capture_frame();
+        if (!fc.available) { err = "screen capture unavailable (needs grim on Hyprland/wlroots)"; return false; }
+        ppm = std::move(fc.ppm);
+    } else if (!read_file_bytes(spec, ppm)) { err = "cannot read image: " + spec; return false; }
+    return g_vision.encode_ppm(ppm, out, err);
+}
+
+// request "images": ["path.ppm", "screen", {"path":..}, {"b64":..}, {"screen":true}]
+static bool collect_images(const json::Value& arr, std::vector<mm::EncodedImage>& out, std::string& err) {
+    if (!arr.is_array() || arr.size() == 0) return true;
+    for (size_t i = 0; i < arr.size(); ++i) {
+        const auto& e = arr[i];
+        mm::EncodedImage im; bool ok;
+        if (e.is_object() && e.contains("b64")) {
+            std::string ppm;
+            if (!mm::b64_decode(e["b64"].get_str(), ppm)) { err = "images[" + std::to_string(i) + "]: bad base64"; return false; }
+            ok = g_vision.encode_ppm(ppm, im, err);
+        } else if (e.is_object() && e["screen"].get_bool(false)) {
+            ok = load_image_spec("screen", im, err);
+        } else {
+            ok = load_image_spec(e.is_object() ? e["path"].get_str() : e.get_str(), im, err);
+        }
+        if (!ok) return false;
+        out.push_back(std::move(im));
+    }
+    return true;
+}
+
+static std::string capabilities_json(const engine::Config& cfg) {
+    std::ostringstream o;
+    o << "{\"vision\":";
+    if (g_vision.ready())
+        o << "{\"path\":\"" << json::escape(g_vision.path()) << "\",\"tokens_per_image\":" << g_vision.tokens_per_image()
+          << ",\"n_embd\":" << g_vision.out_dim() << ",\"marker\":\"<image>\",\"format\":\"ppm\"}";
+    else o << "null";
+    o << ",\"motion\":" << (g_motion.ready() ? g_motion.info_json() : std::string("null"))
+      << ",\"kv_window\":" << cfg.kv_window << "}";
+    return o.str();
+}
+
+
+// =============================================================================
 // FIX (bug 10): this used to emit ChatML (<|im_start|>role\n...<|im_end|>\n),
 // which doesn't exist anywhere in this model's vocab (confirmed via
 // check_tokenizer.py — no <|im_start|>/<|im_end|>/<|im_sep|> entries at
@@ -819,7 +889,8 @@ static void run_generation(const engine::Config& cfg,
                             float top_p,
                             util::ThreadPool& pool,
                             std::mt19937& rng,
-                            OnToken&& on_token)
+                            OnToken&& on_token,
+                            const mm::Prompt* mmp = nullptr)   // non-null: image spans in prompt_ctx get embeddings, not token lookups
 {
     auto& st = get_engine_state(cfg, gguf);
 
@@ -834,6 +905,7 @@ static void run_generation(const engine::Config& cfg,
     if (!prompt_ctx.empty() && match_len >= prompt_ctx.size())
         match_len = prompt_ctx.size() - 1;
 
+    if (mmp && mmp->has_images()) match_len = mm::align_reuse(*mmp, match_len);
     st.cache.length = match_len;
     st.cached_tokens.resize(match_len);
     std::vector<int32_t> new_prompt_tokens(prompt_ctx.begin() + match_len, prompt_ctx.end());
@@ -846,7 +918,15 @@ static void run_generation(const engine::Config& cfg,
     ensure_cache_room(cfg, st, new_prompt_tokens.size());
     VLOG("prefill len=" + std::to_string(new_prompt_tokens.size()));
     auto t_pre = std::chrono::steady_clock::now();
-    fwd::transformer_forward(cfg, st.mw, new_prompt_tokens, st.cache, logits.data(), pool);
+    {
+        std::vector<int32_t> fwd_tokens; std::vector<float> ov_rows; std::vector<uint8_t> ov_mask;
+        fwd::EmbdOverride ov;
+        const bool use_ov = mmp && mmp->has_images() &&
+                            mm::build_override(*mmp, match_len, cfg.n_embd, fwd_tokens, ov_rows, ov_mask);
+        if (use_ov) { ov.rows = ov_rows.data(); ov.mask = ov_mask.data(); }
+        fwd::transformer_forward(cfg, st.mw, use_ov ? fwd_tokens : new_prompt_tokens, st.cache,
+                                 logits.data(), pool, use_ov ? &ov : nullptr);
+    }
     VLOG_ELAPSED("prefill", t_pre);
     st.cached_tokens.insert(st.cached_tokens.end(), new_prompt_tokens.begin(), new_prompt_tokens.end());
 
@@ -907,18 +987,26 @@ static void generate(const engine::Config& cfg,
                      float temperature,
                      float top_p,
                      util::ThreadPool& pool,
-                     std::mt19937& rng)
+                     std::mt19937& rng,
+                     const std::vector<mm::EncodedImage>& images = {})
 {
     VLOG("encode prompt len=" + std::to_string(prompt.size()));
     auto t_enc = std::chrono::steady_clock::now();
-    std::vector<int32_t> ctx = tok.encode(prompt, /*add_bos=*/true);
+    mm::Prompt mmp;
+    std::vector<int32_t> ctx;
+    if (!images.empty()) {
+        mmp = mm::build_prompt(prompt, images, [&](const std::string& s, bool bos) { return tok.encode(s, bos); });
+        ctx = mmp.ids;
+    } else {
+        ctx = tok.encode(prompt, /*add_bos=*/true);
+    }
     VLOG_ELAPSED("tokenize", t_enc);
 
     auto t_gen = std::chrono::steady_clock::now();
     run_generation(cfg, gguf, tok, ctx, max_new_tokens, temperature, top_p, pool, rng,
         [&](int32_t id) {
             std::cout << tok.decode_one(id) << std::flush;
-        });
+        }, images.empty() ? nullptr : &mmp);
     std::cout << tok.flush() << '\n' << std::flush;
     VLOG_ELAPSED("generate total", t_gen);
 }
@@ -953,6 +1041,23 @@ static void run_interactive(const engine::Config& cfg,
             continue;
         }
 
+        // ── non-generation requests: capability query and Motion VAE ops ──
+        if (req["capabilities"].get_bool(false)) {
+            std::cout << "{\"capabilities\":" << capabilities_json(cfg) << "}\n{\"done\":true}\n" << std::flush;
+            continue;
+        }
+        if (req["motion"].is_object()) {
+            try {
+                if (!g_motion.ready()) throw std::runtime_error("motion: no motion model loaded (start NEON with --motion-model)");
+                const std::string reply = g_motion.handle(req["motion"]);   // evaluate first: a throw must not leave a half-written line
+                std::cout << "{\"motion\":" << reply << "}\n" << std::flush;
+            } catch (const std::exception& e) {
+                std::cout << "{\"error\":\"" << json::escape(e.what()) << "\"}\n" << std::flush;
+            }
+            std::cout << "{\"done\":true}\n" << std::flush;
+            continue;
+        }
+
         int   max_tokens  = req["max_tokens"].get_int(256);
         float temperature = req["temperature"].get_float(0.7f);
         float top_p       = req["top_p"].get_float(0.9f);
@@ -965,10 +1070,38 @@ static void run_interactive(const engine::Config& cfg,
             prompt = req["prompt"].get_str();
         }
 
+        // Images (optional): encoded by the ViT into LLM-width tokens and spliced at <image> markers.
+        std::vector<mm::EncodedImage> images;
+        {
+            std::string ierr;
+            if (req["images"].is_array() && req["images"].size() > 0) {
+                if (!g_vision.ready()) ierr = "request has images but no vision model is loaded (start NEON with --vision-model)";
+                else {
+                    auto t_v = std::chrono::steady_clock::now();
+                    collect_images(req["images"], images, ierr);
+                    VLOG_ELAPSED("vision encode", t_v);
+                }
+            }
+            if (!ierr.empty()) {
+                std::cout << "{\"error\":\"" << json::escape(ierr) << "\"}\n{\"done\":true}\n" << std::flush;
+                continue;
+            }
+        }
+
         // Generate and emit each token as a JSON line.
         VLOG("interactive: encode prompt");
         auto t_enc = std::chrono::steady_clock::now();
-        std::vector<int32_t> ctx = tok.encode(prompt, /*add_bos=*/true);
+        mm::Prompt mmp;
+        std::vector<int32_t> ctx;
+        if (!images.empty()) {
+            mmp = mm::build_prompt(prompt, images, [&](const std::string& s, bool bos) { return tok.encode(s, bos); });
+            ctx = mmp.ids;
+        } else {
+            // markers with no images are stripped so a literal "<image>" never reaches the model
+            std::string clean = prompt;
+            for (size_t f; (f = clean.find(mm::kImageMarker())) != std::string::npos; ) clean.erase(f, 7);
+            ctx = tok.encode(clean, /*add_bos=*/true);
+        }
         VLOG_ELAPSED("interactive encode", t_enc);
 
         run_generation(cfg, gguf, tok, ctx, max_tokens, temperature, top_p, pool, rng,
@@ -978,7 +1111,7 @@ static void run_interactive(const engine::Config& cfg,
                 // substring matching.
                 std::cout << "{\"token\":\"" << json::escape(piece) << "\"}\n"
                           << std::flush;
-            });
+            }, images.empty() ? nullptr : &mmp);
         // FIX: decode_one() withholds any trailing bytes that don't yet form
         // a complete UTF-8 codepoint (it can be split across the last two
         // tokens). Drain that buffer now, or the final character of a reply
@@ -2179,6 +2312,20 @@ static int run_model(const std::string& model_path, engine::Config& cfg,
 
     VLOG_ELAPSED("model load+detect", t_start);
 
+    // ── Sidecar models: vision tower + Motion VAE(s). Loaded before --probe so a bad
+    //    or mismatched file fails boot validation instead of the first request. ──
+    if (!g_mm_args.vision_model.empty()) {
+        g_vision.load(g_mm_args.vision_model, cfg.n_embd, &pool);
+        std::cerr << "[Vision] " << g_mm_args.vision_model << ": " << g_vision.tokens_per_image()
+                  << " tokens/image -> n_embd=" << g_vision.out_dim()
+                  << (g_vision.tokens_per_image() * 2 > cfg.kv_window ? "  (WARNING: one image uses over half of kv_window)" : "") << "\n";
+    }
+    for (const auto& mp : g_mm_args.motion_models) {
+        g_motion.load(mp);
+        std::cerr << "[Motion] loaded " << mp << "\n";
+    }
+    if (g_mm_args.motion_seed >= 0) g_motion.set_seed((uint64_t)g_mm_args.motion_seed);
+
     // ── --probe: boot validation used by NEON.py's /api/boot ──────────────
     if (probe_only) {
         std::cout << "PROBE_OK\n" << std::flush;
@@ -2251,7 +2398,16 @@ static int run_model(const std::string& model_path, engine::Config& cfg,
 
     std::mt19937 rng(std::random_device{}());
     std::cerr << "\n--- Generation ---\n";
-    generate(cfg, model, tok, prompt, max_tokens, temperature, top_p, pool, rng);
+    std::vector<mm::EncodedImage> images;
+    if (!g_mm_args.images.empty()) {
+        if (!g_vision.ready()) { std::cerr << "[Error] --image needs --vision-model.\n"; return 1; }
+        for (const auto& spec : g_mm_args.images) {
+            mm::EncodedImage im; std::string err;
+            if (!load_image_spec(spec, im, err)) { std::cerr << "[Error] --image " << spec << ": " << err << "\n"; return 1; }
+            images.push_back(std::move(im));
+        }
+    }
+    generate(cfg, model, tok, prompt, max_tokens, temperature, top_p, pool, rng, images);
     std::cerr << "--- End ---\n";
     return 0;
 }
@@ -2268,6 +2424,12 @@ int main(int argc, char* argv[]) {
                   << " --model <path.gguf|path.nctr>"
                      " [--prompt <text_or_json> | --interactive | --probe | --idle-loop]"
                      " [--threads N]\n"
+                     " Multimodal flags:\n"
+                     "   --vision-model <nanity-vit.gguf>   image encoder; its output width must equal the LM's n_embd\n"
+                     "   --image <file.ppm|screen>          (single-shot) attach an image; repeatable; put <image> in the prompt to place it\n"
+                     "   --motion-model <nanity-mvae.gguf>  Motion VAE and/or controller MLP; repeatable\n"
+                     "   --motion-info | --motion-rollout N | --motion-seed S   motion CLI (works without --model)\n"
+                     "   interactive JSON: {\"images\":[...]} on chat requests, {\"motion\":{\"op\":...}}, {\"capabilities\":true}\n"
                      " Idle-loop flags (only with --idle-loop):\n"
                      "   --idle-seed <text>            implant text, inline (required unless --idle-seed-file)\n"
                      "   --idle-seed-file <path>        implant text, read from a file (overrides --idle-seed)\n"
@@ -2337,6 +2499,12 @@ int main(int argc, char* argv[]) {
         else if (arg == "--interactive")                  interactive   = true;
         else if (arg == "--probe")                        probe_only    = true;
         else if (arg == "--threads"     && i + 1 < argc) threads_override = std::max(0, std::atoi(argv[++i]));
+        else if (arg == "--vision-model"  && i + 1 < argc) g_mm_args.vision_model = argv[++i];
+        else if (arg == "--image"         && i + 1 < argc) g_mm_args.images.push_back(argv[++i]);
+        else if (arg == "--motion-model"  && i + 1 < argc) g_mm_args.motion_models.push_back(argv[++i]);
+        else if (arg == "--motion-info")                   g_mm_args.motion_info = true;
+        else if (arg == "--motion-rollout" && i + 1 < argc) g_mm_args.motion_rollout = std::atol(argv[++i]);
+        else if (arg == "--motion-seed"   && i + 1 < argc) g_mm_args.motion_seed = std::atoll(argv[++i]);
         else if (arg == "--idle-loop")                    idle.enabled  = true;
         else if (arg == "--idle-seed"             && i + 1 < argc) idle.seed_text  = argv[++i];
         else if (arg == "--idle-seed-file"        && i + 1 < argc) idle_seed_file  = argv[++i];
@@ -2435,6 +2603,20 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    if (model_path.empty() && !g_mm_args.motion_models.empty() &&
+        (g_mm_args.motion_info || g_mm_args.motion_rollout > 0)) {
+        // Motion-only CLI: no language model needed.
+        try {
+            for (const auto& mp : g_mm_args.motion_models) g_motion.load(mp);
+            if (g_mm_args.motion_seed >= 0) g_motion.set_seed((uint64_t)g_mm_args.motion_seed);
+            if (g_mm_args.motion_info) std::cout << g_motion.info_json() << "\n";
+            if (g_mm_args.motion_rollout > 0) {
+                json::Value req = json::parse("{\"op\":\"step\",\"n\":" + std::to_string(g_mm_args.motion_rollout) + "}");
+                std::cout << g_motion.handle(req) << "\n";
+            }
+            return 0;
+        } catch (const std::exception& e) { std::cerr << "[CRITICAL ERROR] " << e.what() << "\n"; return 1; }
+    }
     if (model_path.empty()) {
         std::cerr << "[Error] --model is required.\n";
         return 1;
