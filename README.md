@@ -111,10 +111,44 @@ mathematically identical to blending the weights first but never builds
 the mixed weight matrix. Lossy options (F16/BF16/Q8_0 re-encoding, top-k
 expert selection) are opt-in and off by default.
 
-**Integration status.** The vision and motion headers are self-contained
-libraries (they compile and link without the language-model path). The
-`NEON-3.cpp` command line does not yet expose flags for them, so for now
-they are used by including the headers from your own program.
+**Integration status.** Both families are wired into `NEON-3.cpp` through
+[`runtime/multimodal/neon_multimodal.hpp`](./runtime/multimodal/neon_multimodal.hpp),
+and both run on the engine's own `ThreadPool` and the shared `nn` kernels.
+
+*Vision.* `--vision-model <nanity-vit.gguf>` loads the tower at boot (also
+under `--probe`). Its output width must equal the language model's `n_embd`
+(export with a connector that projects to it); a mismatch is refused with a
+message. Images are binary PPM (P6) or the literal `screen` (captured with
+`grim`). The image tokens are fed into the residual stream in place of
+token-table lookups (`fwd::EmbdOverride` in `rawllm_forward.hpp`), so they
+take RoPE positions and KV-cache slots like text. Place an image with an
+`<image>` marker in the prompt; with no marker, images go right after BOS.
+Image positions carry content-derived sentinel ids, so cross-turn KV-prefix
+reuse still works, and recent encodings are cached (re-sending an image every
+turn costs a hash). Image tokens count against `kv_window`.
+```
+neon --model m.gguf --vision-model vit.gguf --image shot.ppm --prompt "what is this? <image>"
+echo '{"messages":[{"role":"user","content":"<image> describe"}],"images":["a.ppm"]}' | neon --model m.gguf --vision-model vit.gguf --interactive
+# images: ["path.ppm", "screen", {"path":..}, {"b64":..}, {"screen":true}]
+```
+
+*Motion.* `--motion-model` (repeatable) loads a pose VAE and/or a controller
+MLP. In `--interactive` mode, `{"motion":{"op":...}}` requests are answered
+with `{"motion":{...}}` and `{"done":true}`: `info`, `reset` (mean pose, or
+`frame` / `frames`), `step` (`n`, `seed`, `temperature`, or `z`, `z_seq`, or
+`obs_seq` through the controller), `decode`, `encode`. `{"capabilities":true}`
+reports what is loaded. A NERVA conditional VQ-VAE (`nanity-cvqvae`, from `nanity_export_cvqvae.py`)
+loads the same way and adds `cvq_encode` (frames -> codes), `cvq_decode`
+(codes -> frames) and `cvq_recon`, each with an optional `action` (name, index
+or null) and `normalized`. Frame counts must be a multiple of 4.
+Motion works without `--model` (pose VAE ops only):
+```
+neon --motion-model pose.gguf --motion-info --motion-rollout 60 --motion-seed 1
+```
+
+Not yet wired: the idle loop (`--idle-vision`) still uses OCR text deltas. It
+can call `g_vision` / `fwd::EmbdOverride` the same way, but that code path
+needs `idle_loop/nectar_cot.hpp`, which is not in this repository.
 
 ## Known limitations
 
@@ -411,8 +445,8 @@ g++ -std=c++20 -O2 -pthread -DUSE_VULKAN runtime/NEON-3.cpp -lvulkan -o neon
 ```
 For the full Vulkan workflow: `git checkout VULKAN-EXPERIMENTAL`.
 
-Vision and motion headers (header-only; include them from your own
-program):
+Vision and motion headers on their own (header-only; include them from your own
+program — `NEON-3.cpp` already does this for you):
 ```
 g++ -std=c++20 -O2 -pthread -mavx2 -mfma -mf16c -I. my_program.cpp -o my_program
 # my_program.cpp:  #include "runtime/vision/rawllm_vit.hpp"
