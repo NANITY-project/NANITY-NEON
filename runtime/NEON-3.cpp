@@ -2321,7 +2321,7 @@ static int run_model(const std::string& model_path, engine::Config& cfg,
                   << (g_vision.tokens_per_image() * 2 > cfg.kv_window ? "  (WARNING: one image uses over half of kv_window)" : "") << "\n";
     }
     for (const auto& mp : g_mm_args.motion_models) {
-        g_motion.load(mp);
+        g_motion.load(mp, &pool);
         std::cerr << "[Motion] loaded " << mp << "\n";
     }
     if (g_mm_args.motion_seed >= 0) g_motion.set_seed((uint64_t)g_mm_args.motion_seed);
