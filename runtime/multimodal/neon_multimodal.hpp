@@ -42,6 +42,7 @@
 #include "../nn/rawllm_nn.hpp"
 #include "../vision/rawllm_vit.hpp"
 #include "../motion/rawllm_mvae.hpp"
+#include "../motion/rawllm_cvqvae.hpp"
 
 namespace mm {
 
@@ -260,7 +261,8 @@ inline bool build_override(const Prompt& p, size_t from, size_t n_embd,
 // ----------------------------------------------------------------------------
 class MotionRuntime {
 public:
-    bool ready() const { return vae_ != nullptr || ctrl_ != nullptr; }
+    bool ready() const { return vae_ != nullptr || ctrl_ != nullptr || cvq_ != nullptr; }
+    bool has_cvqvae() const { return cvq_ != nullptr; }
     bool has_vae() const { return vae_ != nullptr; }
     bool has_controller() const { return ctrl_ != nullptr; }
 
@@ -268,6 +270,13 @@ public:
     void load(const std::string& path, util::ThreadPool* pool = nullptr) {
         auto f = std::make_unique<loader::GGUFLoader>();
         f->open(path);
+        if (f->meta_string("general.architecture", "") == "nanity-cvqvae") {   // NERVA conditional VQ-VAE
+            cvqvae::Options co; co.pool = pool;
+            auto c = std::make_unique<cvqvae::CVQVAE>();
+            c->load(*f, co);
+            cvq_file_ = std::move(f); cvq_ = std::move(c); cvq_path_ = path;
+            return;
+        }
         mvae::Options o; o.pool = pool;
         auto m = std::make_unique<mvae::MotionVAE>();
         m->load(*f, o);
@@ -296,6 +305,14 @@ public:
               << ",\"n_cond\":" << vae_->n_cond << ",\"n_future\":" << vae_->n_future
               << ",\"n_experts\":" << vae_->n_experts << ",\"has_encoder\":" << (vae_->has_encoder() ? "true" : "false") << "}";
         } else o << "\"vae\":null";
+        if (cvq_) {
+            o << ",\"cvqvae\":{\"path\":\"" << json::escape(cvq_path_) << "\",\"window\":" << cvq_->window
+              << ",\"channels\":" << cvq_->channels << ",\"num_codes\":" << cvq_->num_codes
+              << ",\"latent_steps\":" << (cvq_->window >> cvq_->downs) << ",\"frames_per_code\":" << (size_t(1) << cvq_->downs)
+              << ",\"dt\":" << cvq_->dt << ",\"actions\":[";
+            for (size_t i = 0; i < cvq_->action_names.size(); ++i) o << (i ? "," : "") << "\"" << json::escape(cvq_->action_names[i]) << "\"";
+            o << "]}";
+        } else o << ",\"cvqvae\":null";
         if (ctrl_) {
             o << ",\"controller\":{\"path\":\"" << json::escape(ctrl_path_) << "\",\"obs_dim\":" << ctrl_->mlp_in()
               << ",\"action_dim\":" << ctrl_->mlp_out() << "}";
@@ -318,6 +335,7 @@ public:
     std::string handle(const json::Value& req) {
         const std::string op = req["op"].get_str("info");
         if (op == "info") return info_json();
+        if (op == "cvq_encode" || op == "cvq_decode" || op == "cvq_recon") return handle_cvq(op, req);
 
         if (op == "reset") {
             need_vae();
@@ -416,16 +434,84 @@ public:
             return o.str();
         }
 
-        throw std::runtime_error("motion: unknown op '" + op + "' (info|reset|step|decode|encode)");
+        throw std::runtime_error("motion: unknown op '" + op + "' (info|reset|step|decode|encode|cvq_encode|cvq_decode|cvq_recon)");
     }
 
 private:
+    // action: absent/null -> unconditional label; string -> name from the model; number -> index
+    int cvq_action(const json::Value& req) const {
+        const auto& a = req["action"];
+        if (a.is_string()) {
+            if (a.get_str() == "null") return -1;
+            int i = cvq_->action_index(a.get_str());
+            if (i < 0) throw std::runtime_error("cvqvae: unknown action '" + a.get_str() + "' (see info for the list)");
+            return i;
+        }
+        if (a.is_number()) {
+            int i = a.get_int(-1);
+            if (i < -1 || i >= (int)cvq_->n_actions) throw std::runtime_error("cvqvae: action index out of range");
+            return i;
+        }
+        return -1;
+    }
+
+    //   {"op":"cvq_encode","frames":[[30]...],"action":"walk","normalized":false}  -> {"codes":[...]}
+    //   {"op":"cvq_decode","codes":[...],"action":"walk"}                          -> {"frames":[[30]...]}
+    //   {"op":"cvq_recon","frames":[...]}                                          -> encode -> quantise -> decode
+    // Frames are in train_cvqvae.py's canonicalised physical units (flags 0/1); count must be a multiple of 2^downs.
+    // "normalized":true means input/output are model space (decode then returns raw logits for flag channels).
+    std::string handle_cvq(const std::string& op, const json::Value& req) {
+        if (!cvq_) throw std::runtime_error("cvqvae: no cVQ-VAE loaded (start NEON with --motion-model <nanity-cvqvae.gguf>)");
+        const size_t C = cvq_->channels, G = size_t(1) << cvq_->downs;
+        const int act = cvq_action(req);
+        const bool normd = req["normalized"].get_bool(false);
+        std::vector<int32_t> codes;
+        size_t T = 0;
+        if (op != "cvq_decode") {
+            const auto& fr = req["frames"];
+            if (!fr.is_array() || fr.size() == 0 || fr.size() % G)
+                throw std::runtime_error("cvqvae: 'frames' must hold a positive multiple of " + std::to_string(G) + " frames");
+            T = fr.size();
+            std::vector<float> x(T * C), one;
+            for (size_t t = 0; t < T; ++t) { read_floats(fr[t], C, "frames[i]", one); std::copy(one.begin(), one.end(), x.begin() + t * C); }
+            if (!normd) cvq_->normalize(x.data(), x.data(), T);
+            codes.resize(T / G);
+            cvq_->tokens(x.data(), T, act, codes.data());
+            if (op == "cvq_encode") {
+                std::ostringstream o; o << "{\"codes\":[";
+                for (size_t i = 0; i < codes.size(); ++i) o << (i ? "," : "") << codes[i];
+                o << "]}";
+                return o.str();
+            }
+        } else {
+            const auto& cj = req["codes"];
+            if (!cj.is_array() || cj.size() == 0) throw std::runtime_error("cvqvae: 'codes' must be a non-empty array of indices");
+            for (size_t i = 0; i < cj.size(); ++i) codes.push_back(cj[i].get_int(-1));
+            T = codes.size() * G;
+        }
+        std::vector<float> y(T * C), phys(T * C);
+        cvq_->decode_codes(codes.data(), codes.size(), act, y.data());
+        if (!normd) cvq_->to_motion(y.data(), phys.data(), T);
+        const float* out = normd ? y.data() : phys.data();
+        std::ostringstream o; o << "{";
+        if (op == "cvq_recon") {
+            o << "\"codes\":[";
+            for (size_t i = 0; i < codes.size(); ++i) o << (i ? "," : "") << codes[i];
+            o << "],";
+        }
+        o << "\"frames\":[";
+        for (size_t t = 0; t < T; ++t) { if (t) o << ','; append_floats(o, out + t * C, C); }
+        o << "]}";
+        return o.str();
+    }
+
     void need_vae() const {
         if (!vae_) throw std::runtime_error("motion: no pose VAE loaded (start NEON with --motion-model <nanity-mvae.gguf>)");
     }
-    std::unique_ptr<loader::GGUFLoader> vae_file_, ctrl_file_;
+    std::unique_ptr<loader::GGUFLoader> vae_file_, ctrl_file_, cvq_file_;
     std::unique_ptr<mvae::MotionVAE>    vae_, ctrl_;
-    std::string                          vae_path_, ctrl_path_;
+    std::unique_ptr<cvqvae::CVQVAE>     cvq_;
+    std::string                          vae_path_, ctrl_path_, cvq_path_;
     bool                                 have_hist_ = false;
     std::mt19937                         rng_{std::random_device{}()};
 };
