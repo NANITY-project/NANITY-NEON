@@ -1489,6 +1489,18 @@ inline void kv_cache_compact(KVCache& cache, size_t keep, size_t discard, size_t
     cache.length = keep + num_slots + tail_len;
 }
 
+// ───────────────────────── embedding override ───────────────────────────────
+// Lets a caller feed pre-computed embedding rows (e.g. ViT image tokens already
+// projected to n_embd) into the residual stream in place of token-table lookups.
+// rows is [new_tokens.size() x n_embd]; row t is used iff mask[t] != 0, and the
+// corresponding new_tokens[t] is then ignored (callers pass 0 / any placeholder).
+// Everything downstream (RoPE, KV cache, attention) treats these positions
+// exactly like text positions — that is what makes image tokens attendable.
+struct EmbdOverride {
+    const float*   rows = nullptr;
+    const uint8_t* mask = nullptr;
+};
+
 // ───────────────────────── the forward pass ─────────────────────────────────
 
 // new_tokens are the tokens to process *this call* — the prompt on the first
@@ -1510,7 +1522,8 @@ inline void transformer_forward(const engine::Config& cfg,
                                  const std::vector<int32_t>& new_tokens,
                                  KVCache& cache,
                                  float* out_logits,
-                                 util::ThreadPool& pool)
+                                 util::ThreadPool& pool,
+                                 const EmbdOverride* embd_override = nullptr)
 {
     const size_t n_embd    = cfg.n_embd;
     const size_t n_head    = cfg.n_head;
@@ -1554,6 +1567,10 @@ inline void transformer_forward(const engine::Config& cfg,
         size_t n_vocab_rows = (size_t)mw.token_embd->shape[1];
         size_t row_bytes = loader::GGUFLoader::bytes_for_type(mw.token_embd->type, n_embd);
         for (size_t t = 0; t < seq; ++t) {
+            if (embd_override && embd_override->rows && embd_override->mask && embd_override->mask[t]) {
+                std::memcpy(&h[t * n_embd], embd_override->rows + t * n_embd, n_embd * sizeof(float));
+                continue;
+            }
             int32_t tok = new_tokens[t];
             if (tok < 0 || (size_t)tok >= n_vocab_rows)
                 throw std::runtime_error("forward(): token id " + std::to_string(tok) + " out of vocab range");
