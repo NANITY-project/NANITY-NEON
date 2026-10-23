@@ -9,7 +9,8 @@ Handles the checkpoint classes whose inference graph NEON implements:
     PoseVAE                   -> kind "pose_vae"           (plain decoder)
     PoseVAEController/Policy  -> kind "mlp"                (actor: ReLU..., tanh)
 Anything else (AutoEncoder, PoseVQVAE, PoseMixtureSpecialistVAE) is refused with
-an explicit message instead of being half-converted.
+an explicit message instead of being half-converted. (NERVA's conditional VQ-VAE,
+tools/train_cvqvae.py, is a different model: use nanity_export_cvqvae.py.)
 
 Layout decision (this is what makes the runtime fast): each MoE layer's
 (E, in, out) weight is exported as ONE stacked matrix with E*out rows and `in`
