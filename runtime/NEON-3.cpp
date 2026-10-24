@@ -2603,6 +2603,31 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    if (model_path.empty() && !g_mm_args.motion_models.empty() && interactive &&
+        !g_mm_args.motion_info && g_mm_args.motion_rollout <= 0) {
+        // Motion-only server: `neon --motion-model vae.gguf [--motion-model prior.gguf] --interactive`, no language model.
+        // One JSON line in -> {"motion":{...}} (or {"error":"..."}) + {"done":true} out, same framing as the full server.
+        //
+        try {
+            for (const auto& mp : g_mm_args.motion_models) g_motion.load(mp);
+            if (g_mm_args.motion_seed >= 0) g_motion.set_seed((uint64_t)g_mm_args.motion_seed);
+            std::cerr << "[Motion] serving " << g_mm_args.motion_models.size() << " motion model(s), no language model loaded\n";
+        } catch (const std::exception& e) { std::cerr << "[CRITICAL ERROR] " << e.what() << "\n"; return 1; }
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            if (line.empty()) continue;
+            try {
+                json::Value req = json::parse(line);
+                if (!req["motion"].is_object()) throw std::runtime_error("motion-only server (no --model): only {\"motion\":{\"op\":...}} requests are served");
+                const std::string reply = g_motion.handle(req["motion"]);
+                std::cout << "{\"motion\":" << reply << "}\n" << std::flush;
+            } catch (const std::exception& e) {
+                std::cout << "{\"error\":\"" << json::escape(e.what()) << "\"}\n" << std::flush;
+            }
+            std::cout << "{\"done\":true}\n" << std::flush;
+        }
+        return 0;
+    }
     if (model_path.empty() && !g_mm_args.motion_models.empty() &&
         (g_mm_args.motion_info || g_mm_args.motion_rollout > 0)) {
         // Motion-only CLI: no language model needed.
