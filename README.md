@@ -141,7 +141,31 @@ reports what is loaded. A NERVA conditional VQ-VAE (`nanity-cvqvae`, from `nanit
 loads the same way and adds `cvq_encode` (frames -> codes), `cvq_decode`
 (codes -> frames) and `cvq_recon`, each with an optional `action` (name, index
 or null) and `normalized`. Frame counts must be a multiple of 4.
-Motion works without `--model` (pose VAE ops only):
+
+*Prior (generating motion without an input clip).* The cVQ-VAE's autoregressive
+prior (`CodePrior` in NERVA's `tools/train_cvqvae.py`, checkpoint
+`prior_best.pt`) is exported with `conversion/nanity_export_cvqprior.py` to a
+`nanity-cvqprior` GGUF and loaded with another `--motion-model`. It is a small causal
+transformer over the VAE's codes with a KV cache; sampling mirrors the trainer
+(temperature, then top-k, then top-p). Ops: `cvq_sample` (`action`, `windows`,
+`temperature`, `top_k`, `top_p`, `seed`, optional `"decode":true` to also run the
+matching VAE and return `frames` per window), and for endless generation
+`cvq_prior_reset` (`action`, `seed`) followed by one `cvq_prior_next` per window
+(returns `codes`, the prior's `probs` and `entropy` per code, `stride`, optional
+`frames`). `info` reports the prior and whether it matches the loaded VAE (code
+count, codes per window, action list); `"decode":true` is refused when it does not.
+Windows are returned as sampled: overlapping/cross-fading them into a clip is the
+caller's job (NERVA's `stitch`; the exporter stores `stride`).
+```
+neon --motion-model vae.gguf --motion-model prior.gguf --interactive     # no --model needed for motion-only requests
+{"motion":{"op":"cvq_sample","action":"walk","windows":6,"temperature":0.9,"top_k":40,"seed":1,"decode":true}}
+```
+Standalone: `g++ -std=c++20 -O2 -pthread -mavx2 -mfma -mf16c runtime/motion/cvqprior_cli.cpp -o cvqprior`
+(`info`, `sample [--vae VAE.gguf]`, `logits`, `probs`, `selftest`, `bench`);
+`tests/verify_cvqprior.py` checks it against PyTorch (`--nerva`) or a numpy twin.
+
+Motion works without `--model`: `--motion-info` / `--motion-rollout` (pose VAE) and, with
+`--interactive`, the `{"motion":{...}}` ops above:
 ```
 neon --motion-model pose.gguf --motion-info --motion-rollout 60 --motion-seed 1
 ```
@@ -356,6 +380,7 @@ written down here.
 | `nn/rawllm_nn.hpp` | Neural-network kernels: matrix-vector and matrix-matrix products, layer normalization, softmax, activations |
 | `vision/rawllm_vit.hpp` | Vision encoder (Vision Transformer tower plus connector) |
 | `motion/rawllm_mvae.hpp` | Motion VAE inference |
+| `motion/rawllm_cvqprior.hpp` | cVQ-VAE prior: KV-cached causal transformer over the VAE codes, with temperature / top-k / top-p sampling (CLI: `motion/cvqprior_cli.cpp`) |
 
 **`runtime/idle_loop/` — optional (`-DNANITY_ENABLE_IDLE_LOOP`)**
 
@@ -383,6 +408,7 @@ written down here.
 | `nanity_convert.py` | Converts third-party GGUF models into NANITY-conformant GGUF (`--detect-only` checks compatibility first) |
 | `nanity_export_vit.py` | Exports a CLIP / SigLIP vision tower (plus optional connector) to a `nanity-vit` GGUF |
 | `nanity_export_mvae.py` | Exports a Motion VAE checkpoint (safetensors) to a `nanity-mvae` GGUF |
+| `nanity_export_cvqprior.py` | Exports a NERVA cVQ-VAE prior checkpoint (`prior_best.pt`) to a `nanity-cvqprior` GGUF |
 
 **`tests/`, `docs/`**
 
