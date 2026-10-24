@@ -43,6 +43,7 @@
 #include "../vision/rawllm_vit.hpp"
 #include "../motion/rawllm_mvae.hpp"
 #include "../motion/rawllm_cvqvae.hpp"
+#include "../motion/rawllm_cvqprior.hpp"
 
 namespace mm {
 
@@ -261,8 +262,9 @@ inline bool build_override(const Prompt& p, size_t from, size_t n_embd,
 // ----------------------------------------------------------------------------
 class MotionRuntime {
 public:
-    bool ready() const { return vae_ != nullptr || ctrl_ != nullptr || cvq_ != nullptr; }
+    bool ready() const { return vae_ != nullptr || ctrl_ != nullptr || cvq_ != nullptr || prior_ != nullptr; }
     bool has_cvqvae() const { return cvq_ != nullptr; }
+    bool has_cvqprior() const { return prior_ != nullptr; }
     bool has_vae() const { return vae_ != nullptr; }
     bool has_controller() const { return ctrl_ != nullptr; }
 
@@ -277,6 +279,13 @@ public:
             cvq_file_ = std::move(f); cvq_ = std::move(c); cvq_path_ = path;
             return;
         }
+        if (f->meta_string("general.architecture", "") == "nanity-cvqprior") {   // NERVA cVQ-VAE prior (samples the VAE's codes)
+            cvqprior::Options po; po.pool = pool;
+            auto p = std::make_unique<cvqprior::CodePrior>();
+            p->load(*f, po);
+            prior_file_ = std::move(f); prior_ = std::move(p); prior_path_ = path; prior_ready_ = false;
+            return;
+        }
         mvae::Options o; o.pool = pool;
         auto m = std::make_unique<mvae::MotionVAE>();
         m->load(*f, o);
@@ -284,7 +293,7 @@ public:
         else                            { vae_file_  = std::move(f); vae_  = std::move(m); vae_path_  = path; have_hist_ = false; }
     }
 
-    void set_seed(uint64_t s) { rng_.seed((uint32_t)(s ^ (s >> 32))); }
+    void set_seed(uint64_t s) { rng_.seed((uint32_t)(s ^ (s >> 32))); prior_rng_.seed(s); }
 
     // Mean pose as the neutral starting history (normalised 0 == the training mean/midpoint).
     void reset_to_mean() {
@@ -313,6 +322,19 @@ public:
             for (size_t i = 0; i < cvq_->action_names.size(); ++i) o << (i ? "," : "") << "\"" << json::escape(cvq_->action_names[i]) << "\"";
             o << "]}";
         } else o << ",\"cvqvae\":null";
+        if (prior_) {
+            const auto& P = *prior_;
+            o << ",\"cvqprior\":{\"path\":\"" << json::escape(prior_path_) << "\",\"num_codes\":" << P.K << ",\"codes_per_window\":" << P.n
+              << ",\"context_windows\":" << P.windows << ",\"d\":" << P.d << ",\"layers\":" << P.layers << ",\"heads\":" << P.heads
+              << ",\"params\":" << P.params() << ",\"stride\":" << P.stride << ",\"dt\":" << P.dt;
+            if (!std::isnan(P.val_nll)) o << ",\"val_nll\":" << P.val_nll;
+            const std::string why = prior_vs_vae();
+            o << ",\"matches_vae\":" << (cvq_ ? (why.empty() ? "true" : "false") : "null");
+            if (!why.empty()) o << ",\"mismatch\":\"" << json::escape(why) << "\"";
+            o << ",\"actions\":[";
+            for (size_t i = 0; i < P.action_names.size(); ++i) o << (i ? "," : "") << "\"" << json::escape(P.action_names[i]) << "\"";
+            o << "]}";
+        } else o << ",\"cvqprior\":null";
         if (ctrl_) {
             o << ",\"controller\":{\"path\":\"" << json::escape(ctrl_path_) << "\",\"obs_dim\":" << ctrl_->mlp_in()
               << ",\"action_dim\":" << ctrl_->mlp_out() << "}";
@@ -336,6 +358,7 @@ public:
         const std::string op = req["op"].get_str("info");
         if (op == "info") return info_json();
         if (op == "cvq_encode" || op == "cvq_decode" || op == "cvq_recon") return handle_cvq(op, req);
+        if (op == "cvq_sample" || op == "cvq_prior_reset" || op == "cvq_prior_next") return handle_cvq_prior(op, req);
 
         if (op == "reset") {
             need_vae();
@@ -434,7 +457,7 @@ public:
             return o.str();
         }
 
-        throw std::runtime_error("motion: unknown op '" + op + "' (info|reset|step|decode|encode|cvq_encode|cvq_decode|cvq_recon)");
+        throw std::runtime_error("motion: unknown op '" + op + "' (info|reset|step|decode|encode|cvq_encode|cvq_decode|cvq_recon|cvq_sample|cvq_prior_reset|cvq_prior_next)");
     }
 
 private:
@@ -505,12 +528,122 @@ private:
         return o.str();
     }
 
+    // Empty string when the loaded prior and VAE belong together (or one of them is absent).
+    std::string prior_vs_vae() const {
+        if (!prior_ || !cvq_) return "";
+        return cvqprior::check_compatible(prior_->K, prior_->n, prior_->n_actions, prior_->action_names,
+                                          cvq_->num_codes, cvq_->window >> cvq_->downs, cvq_->n_actions, cvq_->action_names);
+    }
+    int prior_action(const json::Value& req) const {
+        const auto& a = req["action"];
+        if (a.is_string()) {
+            if (a.get_str() == "null") return -1;
+            int i = prior_->action_index(a.get_str());
+            if (i < 0) throw std::runtime_error("cvqprior: unknown action '" + a.get_str() + "' (see info for the list)");
+            return i;
+        }
+        if (a.is_number()) {
+            int i = a.get_int(-1);
+            if (i < -1 || i >= (int)prior_->n_actions) throw std::runtime_error("cvqprior: action index out of range");
+            return i;
+        }
+        return -1;
+    }
+    cvqprior::SampleParams prior_params(const json::Value& req) const {
+        cvqprior::SampleParams sp;
+        sp.temperature = req["temperature"].get_float(1.0f);
+        sp.top_k       = req["top_k"].get_int(0);
+        sp.top_p       = req["top_p"].get_float(1.0f);
+        if (!(sp.temperature > 0.f) || sp.top_k < 0 || !(sp.top_p > 0.f))
+            throw std::runtime_error("cvqprior: need temperature > 0, top_k >= 0, top_p > 0");
+        return sp;
+    }
+    // One window of codes -> VAE -> "[ [C]*T ]" (T = n << downs frames; physical units unless normd, then raw model output).
+    void append_window_frames(std::ostringstream& o, const int32_t* codes, int act, bool normd) {
+        const size_t n = prior_->n, C = cvq_->channels, T = n << cvq_->downs;
+        std::vector<float> y(T * C), phys(T * C);
+        cvq_->decode_codes(codes, n, act, y.data());
+        if (!normd) cvq_->to_motion(y.data(), phys.data(), T);
+        const float* out = normd ? y.data() : phys.data();
+        o << '[';
+        for (size_t t = 0; t < T; ++t) { if (t) o << ','; append_floats(o, out + t * C, C); }
+        o << ']';
+    }
+
+    // The prior samples the VAE's discrete codes, so motion can be generated without an input clip.
+    //   {"op":"cvq_sample","action":"walk","windows":6,"temperature":0.9,"top_k":40,"top_p":1.0,"seed":1,"decode":true,"normalized":false}
+    //        -> {"codes":[[n]*windows],"probs":[[n]*windows],"stride":S,"dt":dt[,"frames":[[T][C] per window]]}
+    //   {"op":"cvq_prior_reset","action":"walk","seed":1}          start an endless session (keeps the KV cache between calls)
+    //   {"op":"cvq_prior_next","temperature":0.9,"top_k":40,"decode":true}   -> the next window: {"window":i,"codes":[n],"probs":[n],"entropy":[n][,"frames":[T][C]]}
+    // "probs" = the prior's own probability (temperature 1, unfiltered) of each code it picked. Windows are NOT stitched here:
+    // consecutive windows overlap by (window - stride) frames and are cross-faded by the caller (NERVA's stitch), `stride` is reported.
+    // "decode":true needs a matching VAE loaded too; without one only codes come back.
+    std::string handle_cvq_prior(const std::string& op, const json::Value& req) {
+        if (!prior_) throw std::runtime_error("cvqprior: no prior loaded (start NEON with --motion-model <nanity-cvqprior.gguf>)");
+        const std::string why = prior_vs_vae();
+        const bool dec = req["decode"].get_bool(false);
+        if (dec) {
+            if (!cvq_) throw std::runtime_error("cvqprior: \"decode\":true needs the cVQ-VAE too (--motion-model <nanity-cvqvae.gguf>)");
+            if (!why.empty()) throw std::runtime_error("cvqprior: prior and VAE do not match: " + why);
+        }
+        const bool normd = req["normalized"].get_bool(false);
+        if (req.contains("seed")) prior_rng_.seed((uint64_t)req["seed"].get_int64(0));
+        const size_t n = prior_->n;
+
+        if (op == "cvq_sample") {
+            const int act = prior_action(req);
+            int nw = std::max(1, std::min(req["windows"].get_int(1), 256));
+            const auto sp = prior_params(req);
+            std::vector<int32_t> codes((size_t)nw * n); std::vector<float> pr((size_t)nw * n);
+            prior_->generate(act, (size_t)nw, sp, prior_rng_, codes.data(), pr.data());
+            std::ostringstream o; o << "{\"codes\":[";
+            for (int w = 0; w < nw; ++w) { if (w) o << ','; o << '['; for (size_t i = 0; i < n; ++i) o << (i ? "," : "") << codes[(size_t)w * n + i]; o << ']'; }
+            o << "],\"probs\":[";
+            for (int w = 0; w < nw; ++w) { if (w) o << ','; append_floats(o, pr.data() + (size_t)w * n, n); }
+            o << "],\"stride\":" << prior_->stride << ",\"dt\":" << prior_->dt;
+            if (dec) {
+                o << ",\"frames\":[";
+                for (int w = 0; w < nw; ++w) { if (w) o << ','; append_window_frames(o, codes.data() + (size_t)w * n, act, normd); }
+                o << ']';
+            }
+            o << '}';
+            return o.str();
+        }
+
+        if (op == "cvq_prior_reset") {
+            prior_act_ = prior_action(req);
+            prior_->reset(prior_act_); prior_windows_done_ = 0; prior_ready_ = true;
+            return "{\"ok\":true,\"context_windows\":" + std::to_string(prior_->windows) + ",\"codes_per_window\":" + std::to_string(n) + "}";
+        }
+
+        // cvq_prior_next
+        if (!prior_ready_) { prior_act_ = -1; prior_->reset(-1); prior_windows_done_ = 0; prior_ready_ = true; }   // no reset yet -> unconditional
+        const auto sp = prior_params(req);
+        std::vector<int32_t> codes(n); std::vector<float> pr(n), ent(n);
+        prior_->next_window(prior_windows_done_, prior_rng_, sp, codes.data(), pr.data(), ent.data());
+        std::ostringstream o; o << "{\"window\":" << prior_windows_done_ << ",\"codes\":[";
+        for (size_t i = 0; i < n; ++i) o << (i ? "," : "") << codes[i];
+        o << "],\"probs\":"; append_floats(o, pr.data(), n);
+        o << ",\"entropy\":"; append_floats(o, ent.data(), n);
+        o << ",\"stride\":" << prior_->stride << ",\"dt\":" << prior_->dt;
+        if (dec) { o << ",\"frames\":"; append_window_frames(o, codes.data(), prior_act_, normd); }
+        o << '}';
+        ++prior_windows_done_;
+        return o.str();
+    }
+
     void need_vae() const {
         if (!vae_) throw std::runtime_error("motion: no pose VAE loaded (start NEON with --motion-model <nanity-mvae.gguf>)");
     }
-    std::unique_ptr<loader::GGUFLoader> vae_file_, ctrl_file_, cvq_file_;
+    std::unique_ptr<loader::GGUFLoader> vae_file_, ctrl_file_, cvq_file_, prior_file_;
     std::unique_ptr<mvae::MotionVAE>    vae_, ctrl_;
     std::unique_ptr<cvqvae::CVQVAE>     cvq_;
+    std::unique_ptr<cvqprior::CodePrior> prior_;
+    std::string                          prior_path_;
+    std::mt19937_64                      prior_rng_{std::random_device{}()};
+    bool                                 prior_ready_ = false;
+    int                                  prior_act_ = -1;
+    size_t                               prior_windows_done_ = 0;
     std::string                          vae_path_, ctrl_path_, cvq_path_;
     bool                                 have_hist_ = false;
     std::mt19937                         rng_{std::random_device{}()};
