@@ -23,6 +23,15 @@
 // Exactness: F32 everywhere and matches PyTorch up to float summation order. Options::convert (F32 ->
 // F16/BF16 re-encode of the big matrices at load) is the only lossy knob, off by default.
 // Not thread-safe (state and scratch are members). The RNG is the caller's, so a seed reproduces a run.
+//
+// Goal / style conditioning (priors trained by train_cvqvae.py without --no-prior-goal; old priors have neither and run unchanged):
+//   goal   every window has `goal_dim` numbers (dyaw, dx, dz, speed: read off the motion itself, no labels). They are normalised with the
+//          stored mean/std, embedded by goal_mlp (Linear-GELU-Linear) and ADDED to the input embedding of every position of that window
+//          (input position i belongs to window slot min(i / (n+1), windows-1), slot j = the j-th window of the context). A learned null vector
+//          replaces it (no goal given) -- the unconditional branch.
+//   style  one id per sequence (n_styles = the NULL style), embedded and added to every position.
+//   cfg    set_cfg_scale(s != 1) with a goal on the current window: logits = uncond + s * (cond - uncond), uncond = the goal nulled
+//          (action and style kept). The unconditional branch has its own KV cache, so guidance costs two prior steps per code.
 // =============================================================================
 #include <algorithm>
 #include <cmath>
@@ -125,6 +134,21 @@ public:
     float  dt = 1.f / 30.f;
     double val_nll = std::numeric_limits<double>::quiet_NaN();
     std::vector<std::string> action_names;
+    size_t goal_dim = 0, n_styles = 0;                                      // 0 = this prior was trained without that conditioning
+    std::vector<std::string> goal_names, style_names;
+    std::vector<float> goal_mean, goal_std;                                 // normalisation of the raw goal numbers (the training windows' statistics)
+    float turn_max = 0.f, speed_cruise = 0.f, speed_max = 0.f;              // what the data really contains: |dyaw| p95 per window, median / p95 moving speed
+    bool has_goal()  const { return goal_dim > 0; }
+    bool has_style() const { return n_styles > 0; }
+    // style name -> id; -2 = unknown, so callers can tell it from -1 (= null / no style)
+    int style_index(const std::string& name) const {
+        for (size_t i = 0; i < style_names.size(); ++i) if (style_names[i] == name) return (int)i;
+        return -2;
+    }
+    // raw goal numbers (goal_names order) -> what the network sees
+    void normalise_goal(const float* raw, float* out) const {
+        for (size_t i = 0; i < goal_dim; ++i) out[i] = (raw[i] - goal_mean[i]) / goal_std[i];
+    }
 
     size_t vocab()   const { return K + 3 + n_actions; }
     size_t seq_len() const { return windows * (n + 1); }
@@ -172,44 +196,105 @@ public:
         lnw_ = tf.floats("ln.weight", d); lnb_ = tf.floats("ln.bias", d);
         head_ = tf.linear("head", d, K + 1, false);
 
+        goal_dim = (size_t)num("goal_dim", 0); n_styles = (size_t)num("n_styles", 0);
+        goal_names = detail::parse_json_strings(g.meta_string("nanity.cvqprior.goal_names", ""));
+        style_names = detail::parse_json_strings(g.meta_string("nanity.cvqprior.style_names", ""));
+        goal_mean.clear(); goal_std.clear(); gw0_ = Linear(); gw2_ = Linear(); goal_null_.clear(); style_emb_.clear();
+        if (goal_dim) {
+            if (!goal_names.empty() && goal_names.size() != goal_dim)
+                throw std::runtime_error("cvqprior: goal_names has " + std::to_string(goal_names.size()) + " entries, goal_dim = " + std::to_string(goal_dim));
+            gw0_ = tf.linear("goal_mlp.0", goal_dim, d, true); gw2_ = tf.linear("goal_mlp.2", d, d, true);
+            goal_null_ = tf.floats("goal_null", d);
+            const double nan = std::numeric_limits<double>::quiet_NaN();
+            for (size_t i = 0; i < goal_dim; ++i) {
+                const double m = g.meta_number("nanity.cvqprior.goal_mean." + std::to_string(i), nan), sd = g.meta_number("nanity.cvqprior.goal_std." + std::to_string(i), nan);
+                if (std::isnan(m) || std::isnan(sd) || !(sd > 0.0)) throw std::runtime_error("cvqprior: goal-conditioned prior without goal_mean/goal_std metadata (re-export it)");
+                goal_mean.push_back((float)m); goal_std.push_back((float)sd);
+            }
+            turn_max = (float)num("goal_turn_max", 0); speed_cruise = (float)num("goal_speed_cruise", 0); speed_max = (float)num("goal_speed_max", 0);
+        }
+        if (n_styles) {
+            if (!style_names.empty() && style_names.size() != n_styles)
+                throw std::runtime_error("cvqprior: style_names has " + std::to_string(style_names.size()) + " entries, n_styles = " + std::to_string(n_styles));
+            style_emb_ = tf.floats("style_emb.weight", (n_styles + 1) * d);
+        }
+
         if (opt_.convert)
             for (auto& b : blocks_) for (auto* l : {&b.qkv, &b.proj, &b.ff0, &b.ff2}) l->convert_to(opt_.weights);
         if (opt_.convert) head_.convert_to(opt_.weights);
 
         nparams_ = tok_.size() + pos_.size() + lnw_.size() + lnb_.size() + head_.N * head_.K;
         for (auto& b : blocks_) nparams_ += 4 * d + b.qkv.N * b.qkv.K + 3 * d + b.proj.N * b.proj.K + d + b.ff0.N * b.ff0.K + 4 * d + b.ff2.N * b.ff2.K + d;
-        kc_.assign(layers, std::vector<float>(max_ctx() * d, 0.f));
-        vc_.assign(layers, std::vector<float>(max_ctx() * d, 0.f));
-        ctx_.clear(); fed_ = 0; last_.assign(K + 1, 0.f);
+        if (goal_dim) nparams_ += gw0_.N * gw0_.K + d + gw2_.N * gw2_.K + d + goal_null_.size();
+        nparams_ += style_emb_.size();
+        for (int b = 0; b < (goal_dim ? 2 : 1); ++b) {                          // branch 1 = the unconditional (goal nulled) one, only for goal priors
+            c_[b].k.assign(layers, std::vector<float>(max_ctx() * d, 0.f));
+            c_[b].v.assign(layers, std::vector<float>(max_ctx() * d, 0.f));
+            c_[b].fed = 0;
+        }
+        ctx_.clear(); win_goal_.clear(); style_ = n_styles; last_.assign(K + 1, 0.f); last_u_.assign(K + 1, 0.f);
     }
 
     // ---- incremental context -------------------------------------------------------------------------------
-    // Start a new sequence: ctx = [ACTION]. Cheap: the cache is simply considered empty.
-    void reset(int action) { ctx_.assign(1, action_token(action)); fed_ = 0; }
+    // Start a new sequence: ctx = [ACTION]. Cheap: the caches are simply considered empty.
+    // style: index into style_names; -1 / out of range = the NULL style (only meaningful for a prior trained with styles).
+    void reset(int action, int style = -1) {
+        ctx_.assign(1, action_token(action)); c_[0].fed = c_[1].fed = 0; win_goal_.clear();
+        style_ = (style < 0 || (size_t)style >= n_styles) ? n_styles : (size_t)style;
+    }
     size_t length() const { return ctx_.size(); }
     const std::vector<int32_t>& context() const { return ctx_; }
     void push(int32_t tok) {
         if (tok < 0 || (size_t)tok >= vocab()) throw std::runtime_error("cvqprior: token id out of range");
         ctx_.push_back(tok);
     }
-    // ctx = [ACTION] + ctx[1+n+1:]   (the oldest window and its SEP go; positions shift, so the cache is rebuilt on demand)
+    // ctx = [ACTION] + ctx[1+n+1:]   (the oldest window and its SEP go; positions shift, so the caches are rebuilt on demand;
+    // the goals of the windows that stay move down one slot with them)
     void drop_oldest_window() {
         if (ctx_.size() < 1 + n + 1) throw std::runtime_error("cvqprior: no complete window to drop");
-        ctx_.erase(ctx_.begin() + 1, ctx_.begin() + 1 + (long)(n + 1)); fed_ = 0;
+        ctx_.erase(ctx_.begin() + 1, ctx_.begin() + 1 + (long)(n + 1)); c_[0].fed = c_[1].fed = 0;
+        if (!win_goal_.empty()) win_goal_.erase(win_goal_.begin());
+    }
+    // Classifier-free guidance scale (1 = off). Only acts on windows that were given a goal.
+    void set_cfg_scale(float s) { cfg_scale_ = s; }
+    float cfg_scale() const { return cfg_scale_; }
+    // Declares the goal of the NEXT window of the context: call once per window, after the oldest window was dropped (if it was) and before
+    // that window's tokens are fed. goal_raw = goal_dim raw numbers (goal_names order), nullptr = this window has no goal (null vector).
+    void add_window_goal(const float* goal_raw) {
+        WinGoal wg;
+        if (goal_raw) {
+            if (!goal_dim) throw std::runtime_error("cvqprior: this prior was trained without goal conditioning (re-train without --no-prior-goal)");
+            for (size_t i = 0; i < goal_dim; ++i) if (!std::isfinite(goal_raw[i])) throw std::runtime_error("cvqprior: goal numbers must be finite");
+            std::vector<float> gn(goal_dim); normalise_goal(goal_raw, gn.data());
+            wg.emb = goal_embed(gn.data()); wg.has = true;
+        }
+        win_goal_.push_back(std::move(wg));
     }
     // Logits [K+1] (codes 0..K-1, then SEP) for the token that follows the current context. Feeds whatever is pending.
+    // With guidance active (cfg_scale != 1 and the current window has a goal) these are uncond + s * (cond - uncond).
     const std::vector<float>& logits() {
         if (ctx_.empty()) throw std::runtime_error("cvqprior: call reset(action) first");
         if (ctx_.size() > max_ctx()) throw std::runtime_error("cvqprior: context longer than the model's position table");
-        if (fed_ < ctx_.size()) { forward_chunk(ctx_.data() + fed_, ctx_.size() - fed_, fed_, nullptr, last_.data()); fed_ = ctx_.size(); }
-        return last_;
+        feed(0);
+        if (!cfg_on()) return last_;
+        feed(1);
+        mix_.resize(K + 1);
+        for (size_t j = 0; j <= K; ++j) mix_[j] = last_u_[j] + cfg_scale_ * (last_[j] - last_u_[j]);
+        return mix_;
     }
-    // Reference path for tests: logits [T][K+1] at EVERY position of an arbitrary token sequence (T <= max_ctx), no cache reuse.
-    void forward_all(const int32_t* toks, size_t T, float* out) {
+    // Reference path for tests: logits [T][K+1] at EVERY position of an arbitrary token sequence (T <= max_ctx), no cache reuse, no guidance.
+    // goal_slots = [windows][goal_dim] NORMALISED goals (slot j = the j-th window of the sequence, like the trainer's `goal` input), nullptr = null goal;
+    // style = style id or -1 = null.
+    void forward_all(const int32_t* toks, size_t T, float* out, const float* goal_slots = nullptr, int style = -1) {
         if (!T || T > max_ctx()) throw std::runtime_error("cvqprior: sequence length must be in [1, " + std::to_string(max_ctx()) + "]");
         for (size_t i = 0; i < T; ++i) if (toks[i] < 0 || (size_t)toks[i] >= vocab()) throw std::runtime_error("cvqprior: token id out of range");
-        ctx_.assign(toks, toks + T); fed_ = 0;
-        forward_chunk(ctx_.data(), T, 0, out, last_.data()); fed_ = T;
+        ctx_.assign(toks, toks + T); c_[0].fed = c_[1].fed = 0; win_goal_.clear();
+        style_ = (style < 0 || (size_t)style >= n_styles) ? n_styles : (size_t)style;
+        if (goal_slots) {
+            if (!goal_dim) throw std::runtime_error("cvqprior: this prior was trained without goal conditioning");
+            for (size_t j = 0; j < windows; ++j) { WinGoal wg; wg.emb = goal_embed(goal_slots + j * goal_dim); wg.has = true; win_goal_.push_back(std::move(wg)); }
+        }
+        forward_chunk(0, ctx_.data(), T, 0, out, last_.data()); c_[0].fed = T;
     }
 
     // ---- sampling -------------------------------------------------------------------------------------------
@@ -266,42 +351,75 @@ public:
 
     // Continues the current sequence by one window: n codes, each pushed to the context. Handles the SEP between windows and
     // the sliding context: call it repeatedly after reset(); `windows_done` is how many windows this sequence already has.
-    void next_window(size_t windows_done, std::mt19937_64& rng, const SampleParams& sp, int32_t* codes_out, float* p_raw_out = nullptr, float* entropy_out = nullptr) {
+    // goal_raw: the raw goal numbers of THIS window (goal_dim floats) or nullptr for none.
+    void next_window(size_t windows_done, std::mt19937_64& rng, const SampleParams& sp, int32_t* codes_out, float* p_raw_out = nullptr, float* entropy_out = nullptr,
+                     const float* goal_raw = nullptr) {
         if (windows_done > 0) push(sep_token());
         if (windows_done >= windows) drop_oldest_window();
+        add_window_goal(goal_raw);
         for (size_t i = 0; i < n; ++i) {
             const int32_t c = sample_code(rng, sp, p_raw_out ? p_raw_out + i : nullptr, entropy_out ? entropy_out + i : nullptr);
             push(c); codes_out[i] = c;
         }
     }
 
-    // Whole sequence in one call: n_windows * n codes (row-major [window][code]).
-    void generate(int action, size_t n_windows, const SampleParams& sp, std::mt19937_64& rng, int32_t* out, float* p_raw = nullptr) {
-        reset(action);
-        for (size_t w = 0; w < n_windows; ++w) next_window(w, rng, sp, out + w * n, p_raw ? p_raw + w * n : nullptr, nullptr);
+    // Whole sequence in one call: n_windows * n codes (row-major [window][code]). goals_raw = [n_windows][goal_dim] raw goals or nullptr.
+    void generate(int action, size_t n_windows, const SampleParams& sp, std::mt19937_64& rng, int32_t* out, float* p_raw = nullptr,
+                  const float* goals_raw = nullptr, int style = -1) {
+        reset(action, style);
+        for (size_t w = 0; w < n_windows; ++w)
+            next_window(w, rng, sp, out + w * n, p_raw ? p_raw + w * n : nullptr, nullptr, goals_raw ? goals_raw + w * goal_dim : nullptr);
     }
 
 private:
     struct Block { std::vector<float> n1w, n1b, n2w, n2b; Linear qkv, proj, ff0, ff2; };
+    struct WinGoal { bool has = false; std::vector<float> emb; };            // emb = goal_mlp(normalised goal), d floats
+    struct Cache { std::vector<std::vector<float>> k, v; size_t fed = 0; };  // k/v [layer][position][d]  (head h lives at columns h*hd .. h*hd+hd)
 
     Options opt_;
-    size_t hd_ = 64, nparams_ = 0, fed_ = 0;
+    size_t hd_ = 64, nparams_ = 0;
     std::vector<float> tok_, pos_, lnw_, lnb_;
     std::vector<Block> blocks_;
-    Linear head_;
-    std::vector<std::vector<float>> kc_, vc_;      // [layer][position][d]  (head h lives at columns h*hd .. h*hd+hd)
+    Linear head_, gw0_, gw2_;
+    std::vector<float> goal_null_, style_emb_;
+    Cache c_[2];                                   // [0] = the conditioned branch, [1] = the unconditional one (goal nulled), used for guidance only
     std::vector<int32_t> ctx_;
-    std::vector<float> last_, x_, h_, qkv_, att_, tmp_, ff_, sc_, rows_;
+    std::vector<WinGoal> win_goal_;                // one per window of the context, in order (fewer than the windows present = the rest have no goal)
+    size_t style_ = 0;                             // 0..n_styles-1, n_styles = NULL
+    float cfg_scale_ = 1.f;
+    std::vector<float> last_, last_u_, mix_, x_, h_, qkv_, att_, tmp_, ff_, sc_, rows_;
 
-    // Runs M new tokens at positions t0..t0+M-1 through every block (their K/V are appended to the cache and they attend to the cache
+    bool cfg_on() const { return cfg_scale_ != 1.f && goal_dim > 0 && !win_goal_.empty() && win_goal_.back().has; }
+    std::vector<float> goal_embed(const float* gnorm) const {
+        std::vector<float> hid(d), e(d);
+        nn::linear(gw0_, gnorm, 1, goal_dim, hid.data(), d, Act::GeluErf, nullptr);
+        nn::linear(gw2_, hid.data(), 1, d, e.data(), d, Act::None, nullptr);
+        return e;
+    }
+    void feed(int b) {
+        Cache& C = c_[b];
+        if (C.fed < ctx_.size()) { forward_chunk(b, ctx_.data() + C.fed, ctx_.size() - C.fed, C.fed, nullptr, b ? last_u_.data() : last_.data()); C.fed = ctx_.size(); }
+    }
+
+    // Runs M new tokens at positions t0..t0+M-1 through every block (their K/V are appended to the cache of branch b and they attend to the cache
     // plus each other, causally). Writes the logits of ALL M rows to out_all ([M][K+1]) if given, and the last row's to out_last.
-    void forward_chunk(const int32_t* toks, size_t M, size_t t0, float* out_all, float* out_last) {
+    // Branch 1 sees the null goal everywhere; both branches see the same style.
+    void forward_chunk(int br, const int32_t* toks, size_t M, size_t t0, float* out_all, float* out_last) {
         if (t0 + M > max_ctx()) throw std::runtime_error("cvqprior: context overflow");
+        Cache& C = c_[br];
         const size_t D = d;
         x_.resize(M * D); h_.resize(M * D); qkv_.resize(M * 3 * D); att_.resize(M * D); tmp_.resize(M * D); ff_.resize(M * 4 * D); sc_.resize(max_ctx());
         for (size_t i = 0; i < M; ++i) {
-            const float* te = tok_.data() + (size_t)toks[i] * D; const float* pe = pos_.data() + (t0 + i) * D;
+            const size_t p = t0 + i;
+            const float* te = tok_.data() + (size_t)toks[i] * D; const float* pe = pos_.data() + p * D;
             for (size_t j = 0; j < D; ++j) x_[i * D + j] = te[j] + pe[j];
+            if (goal_dim) {
+                const size_t slot = std::min(p / (n + 1), windows - 1);
+                const float* ge = goal_null_.data();
+                if (br == 0 && slot < win_goal_.size() && win_goal_[slot].has) ge = win_goal_[slot].emb.data();
+                for (size_t j = 0; j < D; ++j) x_[i * D + j] += ge[j];
+            }
+            if (n_styles) { const float* se = style_emb_.data() + style_ * D; for (size_t j = 0; j < D; ++j) x_[i * D + j] += se[j]; }
         }
         const float scale = 1.f / std::sqrt((float)hd_);
         for (size_t l = 0; l < layers; ++l) {
@@ -310,20 +428,20 @@ private:
             for (size_t i = 0; i < M; ++i) nn::layernorm_row(h_.data() + i * D, D, B.n1w.data(), B.n1b.data(), 1e-5f);
             nn::linear(B.qkv, h_.data(), M, D, qkv_.data(), 3 * D, Act::None, opt_.pool);
             for (size_t i = 0; i < M; ++i) {
-                std::memcpy(kc_[l].data() + (t0 + i) * D, qkv_.data() + i * 3 * D + D,     D * sizeof(float));
-                std::memcpy(vc_[l].data() + (t0 + i) * D, qkv_.data() + i * 3 * D + 2 * D, D * sizeof(float));
+                std::memcpy(C.k[l].data() + (t0 + i) * D, qkv_.data() + i * 3 * D + D,     D * sizeof(float));
+                std::memcpy(C.v[l].data() + (t0 + i) * D, qkv_.data() + i * 3 * D + 2 * D, D * sizeof(float));
             }
             for (size_t i = 0; i < M; ++i) {
                 const size_t len = t0 + i + 1;                                // causal: positions 0..t0+i
                 for (size_t h = 0; h < heads; ++h) {
                     const float* q = qkv_.data() + i * 3 * D + h * hd_;
-                    for (size_t j = 0; j < len; ++j) sc_[j] = nn::dot_f32(q, kc_[l].data() + j * D + h * hd_, hd_);
+                    for (size_t j = 0; j < len; ++j) sc_[j] = nn::dot_f32(q, C.k[l].data() + j * D + h * hd_, hd_);
                     nn::softmax_scaled(sc_.data(), len, scale);
                     float* o = att_.data() + i * D + h * hd_;
                     for (size_t e = 0; e < hd_; ++e) o[e] = 0.f;
                     for (size_t j = 0; j < len; ++j) {
-                        const float p = sc_[j]; const float* v = vc_[l].data() + j * D + h * hd_;
-                        for (size_t e = 0; e < hd_; ++e) o[e] += p * v[e];
+                        const float pr = sc_[j]; const float* v = C.v[l].data() + j * D + h * hd_;
+                        for (size_t e = 0; e < hd_; ++e) o[e] += pr * v[e];
                     }
                 }
             }
