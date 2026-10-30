@@ -12,12 +12,18 @@ what makes "generate new motion" possible without an input clip.
 
 Checkpoint layout this script understands (dict saved by train_cvqvae.py):
     model   state_dict  (tok, pos, blocks.N.{n1,qkv,proj,n2,ff.0,ff.2}, ln, head)
-    cfg     dict        (K, n_actions, n, windows, d, layers, heads, dropout)
+    cfg     dict        (K, n_actions, n, windows, d, layers, heads, dropout[, goal_dim, n_styles])
     names   list[str]   action names (optional but strongly recommended)
     stride  int         frame stride between consecutive windows (optional; the
                         runtime/UI need it to stitch windows into a clip)
     dt      float       seconds per frame (optional)
     val_nll float       validation NLL of the checkpoint (optional, informational)
+    goal_stats  dict    (priors trained with goal conditioning) mean/std (normalisation of the 4 goal numbers), turn_max,
+                        speed_cruise, speed_max: what a planner needs to ask for goals the data actually contains
+    goal_names  list    the goal numbers' names (dyaw, dx, dz, speed)
+    style_names list    (priors trained with style ids) index -> style name; the last embedding row is the NULL style
+Goal / style conditioning is optional: a prior trained without it (cfg has no goal_dim / n_styles, or both 0) exports exactly as before.
+With it the extra tensors are goal_mlp.0 (Linear goal_dim->d), goal_mlp.2 (Linear d->d), goal_null (d) and style_emb.weight (n_styles+1, d).
 Anything else in the state_dict is refused by name rather than silently dropped.
 
 Layout decisions:
@@ -99,11 +105,11 @@ def export_ckpt(ck, dst, dtype="f32"):
             sys.exit(f"{name}: size {v.shape[0]} != expected {expect}")
         out[name] = np.ascontiguousarray(v, dtype=np.float32)
 
-    def lin(stem, nout, kin, bias=True):                 # nn.Linear weight (out,in) -> [N,K]
+    def lin(stem, nout, kin, bias=True, f32=False):      # nn.Linear weight (out,in) -> [N,K]
         W = take(stem + ".weight")
         if W.shape != (nout, kin):
             sys.exit(f"{stem}.weight shape {W.shape} != {(nout, kin)}")
-        out[stem + ".weight"] = np.ascontiguousarray(W, dtype=wdt)
+        out[stem + ".weight"] = np.ascontiguousarray(W, dtype=np.float32 if f32 else wdt)
         if bias:
             vec(stem + ".bias", nout)
 
@@ -123,6 +129,18 @@ def export_ckpt(ck, dst, dtype="f32"):
         lin(p + ".ff.0", 4 * d, d); lin(p + ".ff.2", d, 4 * d)
     vec("ln.weight", d); vec("ln.bias", d)
     lin("head", K + 1, d, bias=False)
+
+    G, NS = int(cfg.get("goal_dim", 0) or 0), int(cfg.get("n_styles", 0) or 0)
+    if G:
+        lin("goal_mlp.0", d, G, f32=True); lin("goal_mlp.2", d, d, f32=True); vec("goal_null", d)     # tiny and it carries the conditioning: always F32
+        gs = ck.get("goal_stats")
+        if not gs or len(gs.get("mean", [])) != G or len(gs.get("std", [])) != G:
+            sys.exit(f"cfg says goal_dim={G} but the checkpoint has no goal_stats (mean/std of {G} values): the goal numbers cannot be normalised without them")
+    if NS:
+        emb("style_emb.weight", NS + 1)
+        sn = [str(x) for x in (ck.get("style_names") or [])]
+        if sn and len(sn) != NS:
+            sys.exit(f"'style_names' has {len(sn)} entries but cfg.n_styles = {NS}")
 
     leftovers = sorted(set(T) - used)
     if leftovers:
@@ -146,12 +164,24 @@ def export_ckpt(ck, dst, dtype="f32"):
         w.add_float32("nanity.cvqprior.val_nll", float(ck["val_nll"]))
     if names:
         w.add_string("nanity.cvqprior.action_names", json.dumps(names))
+    w.add_uint32("nanity.cvqprior.goal_dim", G); w.add_uint32("nanity.cvqprior.n_styles", NS)
+    if G:
+        gs = ck["goal_stats"]
+        w.add_string("nanity.cvqprior.goal_names", json.dumps([str(x) for x in (ck.get("goal_names") or [f"g{i}" for i in range(G)])]))
+        for i in range(G):                                                  # scalar keys: no array metadata needed in the loader
+            w.add_float32(f"nanity.cvqprior.goal_mean.{i}", float(gs["mean"][i])); w.add_float32(f"nanity.cvqprior.goal_std.{i}", float(gs["std"][i]))
+        for k in ("turn_max", "speed_cruise", "speed_max"):
+            if k in gs:
+                w.add_float32(f"nanity.cvqprior.goal_{k}", float(gs[k]))
+    if NS and ck.get("style_names"):
+        w.add_string("nanity.cvqprior.style_names", json.dumps([str(x) for x in ck["style_names"]]))
     for name, arr in out.items():
         w.add_tensor(name, arr)
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
     nparam = sum(int(np.prod(v.shape)) for v in out.values())
     print(f"wrote {dst}: tensors={len(out)} params={nparam/1e6:.2f}M dtype={dtype} "
           f"codes={K} per-window={n} context={Lw} windows layers={nl} d={d} heads={H} actions={n_act} (+null)"
+          + (f" goal={G} numbers" if G else " no goal") + (f" styles={NS} (+null)" if NS else " no style")
           + ("" if ck.get("stride") else "   [no stride stored: the UI/stitcher will need it from the VAE dataset]"))
 
 
