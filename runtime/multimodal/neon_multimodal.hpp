@@ -333,6 +333,16 @@ public:
             if (!why.empty()) o << ",\"mismatch\":\"" << json::escape(why) << "\"";
             o << ",\"actions\":[";
             for (size_t i = 0; i < P.action_names.size(); ++i) o << (i ? "," : "") << "\"" << json::escape(P.action_names[i]) << "\"";
+            o << "]";
+            if (P.has_goal()) {                                        // what a planner needs: the numbers' names + what the training windows really contain
+                o << ",\"goal\":{\"names\":[";
+                for (size_t i = 0; i < P.goal_dim; ++i) o << (i ? "," : "") << "\"" << json::escape(i < P.goal_names.size() ? P.goal_names[i] : "g" + std::to_string(i)) << "\"";
+                o << "],\"mean\":"; append_floats(o, P.goal_mean.data(), P.goal_dim);
+                o << ",\"std\":"; append_floats(o, P.goal_std.data(), P.goal_dim);
+                o << ",\"turn_max\":" << P.turn_max << ",\"speed_cruise\":" << P.speed_cruise << ",\"speed_max\":" << P.speed_max << "}";
+            } else o << ",\"goal\":null";
+            o << ",\"styles\":[";
+            for (size_t i = 0; i < P.style_names.size(); ++i) o << (i ? "," : "") << "\"" << json::escape(P.style_names[i]) << "\"";
             o << "]}";
         } else o << ",\"cvqprior\":null";
         if (ctrl_) {
@@ -549,6 +559,46 @@ private:
         }
         return -1;
     }
+    // style: a name from info.styles, an index, "null"/absent = none (-1)
+    int prior_style(const json::Value& req) const {
+        const auto& a = req["style"];
+        if (a.is_null()) return -1;
+        if (!prior_->has_style()) throw std::runtime_error("cvqprior: this prior was trained without style ids");
+        if (a.is_string()) {
+            if (a.get_str() == "null") return -1;
+            int i = prior_->style_index(a.get_str());
+            if (i < 0) throw std::runtime_error("cvqprior: unknown style '" + a.get_str() + "' (see info.styles)");
+            return i;
+        }
+        if (a.is_number()) {
+            int i = a.get_int(-1);
+            if (i < -1 || i >= (int)prior_->n_styles) throw std::runtime_error("cvqprior: style index out of range");
+            return i;
+        }
+        throw std::runtime_error("cvqprior: \"style\" must be a name, an index or null");
+    }
+    // goal: goal_dim RAW numbers in info.goal.names order (the prior normalises them); null/absent -> {} (no goal for that window)
+    std::vector<float> prior_goal(const json::Value& g) const {
+        std::vector<float> out;
+        if (g.is_null()) return out;
+        if (!prior_->has_goal()) throw std::runtime_error("cvqprior: this prior was trained without goal conditioning (re-train without --no-prior-goal)");
+        if (!g.is_array() || g.size() != prior_->goal_dim)
+            throw std::runtime_error("cvqprior: a goal is an array of " + std::to_string(prior_->goal_dim) + " numbers (see info.goal.names)");
+        for (size_t i = 0; i < prior_->goal_dim; ++i) {
+            if (!g[i].is_number()) throw std::runtime_error("cvqprior: goal entries must be numbers");
+            const float v = g[i].get_float(0.f);
+            if (!std::isfinite(v)) throw std::runtime_error("cvqprior: goal numbers must be finite");
+            out.push_back(v);
+        }
+        return out;
+    }
+    float prior_cfg(const json::Value& req, float def) const {
+        const float s = req["cfg_scale"].get_float(def);
+        if (!std::isfinite(s) || s < 0.f || s > 20.f) throw std::runtime_error("cvqprior: cfg_scale must be in [0, 20] (1 = off)");
+        if (s != 1.f && !prior_->has_goal()) throw std::runtime_error("cvqprior: cfg_scale needs a prior trained with goal conditioning");
+        return s;
+    }
+    static const float* nullptr_or(const std::vector<float>& v) { return v.empty() ? nullptr : v.data(); }
     cvqprior::SampleParams prior_params(const json::Value& req) const {
         cvqprior::SampleParams sp;
         sp.temperature = req["temperature"].get_float(1.0f);
@@ -575,6 +625,9 @@ private:
     //        -> {"codes":[[n]*windows],"probs":[[n]*windows],"stride":S,"dt":dt[,"frames":[[T][C] per window]]}
     //   {"op":"cvq_prior_reset","action":"walk","seed":1}          start an endless session (keeps the KV cache between calls)
     //   {"op":"cvq_prior_next","temperature":0.9,"top_k":40,"decode":true}   -> the next window: {"window":i,"codes":[n],"probs":[n],"entropy":[n][,"frames":[T][C]]}
+    // Goal-conditioned priors (info.goal != null) also take, all optional: "style" (name from info.styles | index | null), "cfg_scale" (1 = off; reset / cvq_sample),
+    // "goal": [dyaw,dx,dz,speed] RAW numbers for THIS window (cvq_prior_next), or "goal" (one for every window) / "goals" (one per window, the last repeats) in cvq_sample.
+    // No "action" (or "null") + a goal = movement described by numbers only, no label. A window without a goal uses the null goal.
     // "probs" = the prior's own probability (temperature 1, unfiltered) of each code it picked. Windows are NOT stitched here:
     // consecutive windows overlap by (window - stride) frames and are cross-faded by the caller (NERVA's stitch), `stride` is reported.
     // "decode":true needs a matching VAE loaded too; without one only codes come back.
@@ -594,8 +647,21 @@ private:
             const int act = prior_action(req);
             int nw = std::max(1, std::min(req["windows"].get_int(1), 256));
             const auto sp = prior_params(req);
+            const int sty = prior_style(req);
+            std::vector<float> gflat;
+            if (req["goals"].is_array() && req["goals"].size() > 0) {
+                for (int w = 0; w < nw; ++w) {
+                    auto g = prior_goal(req["goals"][std::min<size_t>((size_t)w, req["goals"].size() - 1)]);
+                    if (g.empty()) throw std::runtime_error("cvqprior: every entry of \"goals\" must be an array of numbers");
+                    gflat.insert(gflat.end(), g.begin(), g.end());
+                }
+            } else {
+                auto g = prior_goal(req["goal"]);
+                if (!g.empty()) for (int w = 0; w < nw; ++w) gflat.insert(gflat.end(), g.begin(), g.end());
+            }
+            prior_->set_cfg_scale(prior_cfg(req, 1.f));
             std::vector<int32_t> codes((size_t)nw * n); std::vector<float> pr((size_t)nw * n);
-            prior_->generate(act, (size_t)nw, sp, prior_rng_, codes.data(), pr.data());
+            prior_->generate(act, (size_t)nw, sp, prior_rng_, codes.data(), pr.data(), gflat.empty() ? nullptr : gflat.data(), sty);
             std::ostringstream o; o << "{\"codes\":[";
             for (int w = 0; w < nw; ++w) { if (w) o << ','; o << '['; for (size_t i = 0; i < n; ++i) o << (i ? "," : "") << codes[(size_t)w * n + i]; o << ']'; }
             o << "],\"probs\":[";
@@ -612,7 +678,8 @@ private:
 
         if (op == "cvq_prior_reset") {
             prior_act_ = prior_action(req);
-            prior_->reset(prior_act_); prior_windows_done_ = 0; prior_ready_ = true;
+            const int sty = prior_style(req); const float cfg = prior_cfg(req, 1.f);
+            prior_->reset(prior_act_, sty); prior_->set_cfg_scale(cfg); prior_windows_done_ = 0; prior_ready_ = true;
             return "{\"ok\":true,\"context_windows\":" + std::to_string(prior_->windows) + ",\"codes_per_window\":" + std::to_string(n) + "}";
         }
 
@@ -620,7 +687,9 @@ private:
         if (!prior_ready_) { prior_act_ = -1; prior_->reset(-1); prior_windows_done_ = 0; prior_ready_ = true; }   // no reset yet -> unconditional
         const auto sp = prior_params(req);
         std::vector<int32_t> codes(n); std::vector<float> pr(n), ent(n);
-        prior_->next_window(prior_windows_done_, prior_rng_, sp, codes.data(), pr.data(), ent.data());
+        const auto goal = prior_goal(req["goal"]);
+        if (req.contains("cfg_scale")) prior_->set_cfg_scale(prior_cfg(req, 1.f));
+        prior_->next_window(prior_windows_done_, prior_rng_, sp, codes.data(), pr.data(), ent.data(), nullptr_or(goal));
         std::ostringstream o; o << "{\"window\":" << prior_windows_done_ << ",\"codes\":[";
         for (size_t i = 0; i < n; ++i) o << (i ? "," : "") << codes[i];
         o << "],\"probs\":"; append_floats(o, pr.data(), n);
