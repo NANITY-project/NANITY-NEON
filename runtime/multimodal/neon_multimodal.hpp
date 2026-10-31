@@ -283,7 +283,7 @@ public:
             cvqprior::Options po; po.pool = pool;
             auto p = std::make_unique<cvqprior::CodePrior>();
             p->load(*f, po);
-            prior_file_ = std::move(f); prior_ = std::move(p); prior_path_ = path; prior_ready_ = false;
+            prior_file_ = std::move(f); prior_ = std::move(p); prior_path_ = path; prior_ready_ = false; prior_plan_.clear();
             return;
         }
         mvae::Options o; o.pool = pool;
@@ -598,6 +598,24 @@ private:
         if (s != 1.f && !prior_->has_goal()) throw std::runtime_error("cvqprior: cfg_scale needs a prior trained with goal conditioning");
         return s;
     }
+    // A goal plan for an endless session (cvq_prior_reset): "goals" = one raw goal per window, the last one repeats; "goal" = the same goal for every window.
+    // {} = no plan (windows then run with the null goal unless cvq_prior_next brings its own). Same rules as cvq_sample: "goals" wins over "goal", every entry must be an array.
+    std::vector<std::vector<float>> prior_plan(const json::Value& req) const {
+        std::vector<std::vector<float>> plan;
+        const auto& gs = req["goals"];
+        if (gs.is_array() && gs.size() > 0) {
+            if (gs.size() > 4096) throw std::runtime_error("cvqprior: \"goals\" holds at most 4096 windows");
+            for (size_t i = 0; i < gs.size(); ++i) {
+                auto g = prior_goal(gs[i]);
+                if (g.empty()) throw std::runtime_error("cvqprior: every entry of \"goals\" must be an array of numbers");
+                plan.push_back(std::move(g));
+            }
+        } else {
+            auto g = prior_goal(req["goal"]);
+            if (!g.empty()) plan.push_back(std::move(g));
+        }
+        return plan;
+    }
     static const float* nullptr_or(const std::vector<float>& v) { return v.empty() ? nullptr : v.data(); }
     cvqprior::SampleParams prior_params(const json::Value& req) const {
         cvqprior::SampleParams sp;
@@ -623,10 +641,14 @@ private:
     // The prior samples the VAE's discrete codes, so motion can be generated without an input clip.
     //   {"op":"cvq_sample","action":"walk","windows":6,"temperature":0.9,"top_k":40,"top_p":1.0,"seed":1,"decode":true,"normalized":false}
     //        -> {"codes":[[n]*windows],"probs":[[n]*windows],"stride":S,"dt":dt[,"frames":[[T][C] per window]]}
-    //   {"op":"cvq_prior_reset","action":"walk","seed":1}          start an endless session (keeps the KV cache between calls)
+    //   {"op":"cvq_prior_reset","action":"walk","seed":1}          start an endless session (keeps the KV cache between calls) -> {"ok":true,"context_windows":L,"codes_per_window":n,"planned_windows":P}
     //   {"op":"cvq_prior_next","temperature":0.9,"top_k":40,"decode":true}   -> the next window: {"window":i,"codes":[n],"probs":[n],"entropy":[n][,"frames":[T][C]]}
     // Goal-conditioned priors (info.goal != null) also take, all optional: "style" (name from info.styles | index | null), "cfg_scale" (1 = off; reset / cvq_sample),
-    // "goal": [dyaw,dx,dz,speed] RAW numbers for THIS window (cvq_prior_next), or "goal" (one for every window) / "goals" (one per window, the last repeats) in cvq_sample.
+    // goals are [dyaw,dx,dz,speed] RAW numbers (info.goal.names; the prior normalises them):
+    //   cvq_sample          "goal" (the same for every window) or "goals" (one per window, the last repeats)
+    //   cvq_prior_reset     "goal" / "goals" as in cvq_sample: a PLAN for the session, window i uses entry min(i, size-1); "planned_windows" in the reply is its length (0 = no plan).
+    //                       A reset without them clears the old plan. (An older NEON ignores these keys without a word: look for info.goal, or planned_windows in the reply.)
+    //   cvq_prior_next      "goal": THIS window's goal; given, it wins over the plan, "goal":null means no goal for this window; absent -> the plan's entry (or none)
     // No "action" (or "null") + a goal = movement described by numbers only, no label. A window without a goal uses the null goal.
     // "probs" = the prior's own probability (temperature 1, unfiltered) of each code it picked. Windows are NOT stitched here:
     // consecutive windows overlap by (window - stride) frames and are cross-faded by the caller (NERVA's stitch), `stride` is reported.
@@ -640,7 +662,7 @@ private:
             if (!why.empty()) throw std::runtime_error("cvqprior: prior and VAE do not match: " + why);
         }
         const bool normd = req["normalized"].get_bool(false);
-        if (req.contains("seed")) prior_rng_.seed((uint64_t)req["seed"].get_int64(0));
+        if (op != "cvq_prior_reset" && req.contains("seed")) prior_rng_.seed((uint64_t)req["seed"].get_int64(0));   // a reset seeds after its request checked out (below)
         const size_t n = prior_->n;
 
         if (op == "cvq_sample") {
@@ -677,17 +699,24 @@ private:
         }
 
         if (op == "cvq_prior_reset") {
-            prior_act_ = prior_action(req);
+            const int act = prior_action(req);                                    // everything is checked before the session changes: a refused reset leaves the old one alone
             const int sty = prior_style(req); const float cfg = prior_cfg(req, 1.f);
+            auto plan = prior_plan(req);
+            if (req.contains("seed")) prior_rng_.seed((uint64_t)req["seed"].get_int64(0));
+            prior_act_ = act;
             prior_->reset(prior_act_, sty); prior_->set_cfg_scale(cfg); prior_windows_done_ = 0; prior_ready_ = true;
-            return "{\"ok\":true,\"context_windows\":" + std::to_string(prior_->windows) + ",\"codes_per_window\":" + std::to_string(n) + "}";
+            prior_plan_ = std::move(plan);
+            return "{\"ok\":true,\"context_windows\":" + std::to_string(prior_->windows) + ",\"codes_per_window\":" + std::to_string(n)
+                 + ",\"planned_windows\":" + std::to_string(prior_plan_.size()) + "}";
         }
 
         // cvq_prior_next
-        if (!prior_ready_) { prior_act_ = -1; prior_->reset(-1); prior_windows_done_ = 0; prior_ready_ = true; }   // no reset yet -> unconditional
+        if (!prior_ready_) { prior_act_ = -1; prior_->reset(-1); prior_windows_done_ = 0; prior_ready_ = true; prior_plan_.clear(); }   // no reset yet -> unconditional
         const auto sp = prior_params(req);
         std::vector<int32_t> codes(n); std::vector<float> pr(n), ent(n);
-        const auto goal = prior_goal(req["goal"]);
+        std::vector<float> goal;
+        if (req.contains("goal")) goal = prior_goal(req["goal"]);                 // given here: this window's goal ("goal":null = none, even if the reset planned one)
+        else if (!prior_plan_.empty()) goal = prior_plan_[std::min(prior_windows_done_, prior_plan_.size() - 1)];   // else the reset's plan (the last entry repeats)
         if (req.contains("cfg_scale")) prior_->set_cfg_scale(prior_cfg(req, 1.f));
         prior_->next_window(prior_windows_done_, prior_rng_, sp, codes.data(), pr.data(), ent.data(), nullptr_or(goal));
         std::ostringstream o; o << "{\"window\":" << prior_windows_done_ << ",\"codes\":[";
@@ -711,6 +740,7 @@ private:
     std::string                          prior_path_;
     std::mt19937_64                      prior_rng_{std::random_device{}()};
     bool                                 prior_ready_ = false;
+    std::vector<std::vector<float>>      prior_plan_;          // raw goals from cvq_prior_reset ("goal" / "goals"); window i uses entry min(i, size-1)
     int                                  prior_act_ = -1;
     size_t                               prior_windows_done_ = 0;
     std::string                          vae_path_, ctrl_path_, cvq_path_;
