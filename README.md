@@ -154,6 +154,13 @@ matching VAE and return `frames` per window), and for endless generation
 (returns `codes`, the prior's `probs` and `entropy` per code, `stride`, optional
 `frames`). `info` reports the prior and whether it matches the loaded VAE (code
 count, codes per window, action list); `"decode":true` is refused when it does not.
+A prior trained with goal numbers (`info.cvqprior.goal` is not null: `dyaw, dx, dz, speed` of a
+window, raw numbers) steers by them instead of, or on top of, an action label: `cvq_sample`
+takes `goal` / `goals`, `cvq_prior_reset` takes the same as a plan for the session (window *i*
+uses entry *min(i, size-1)*; the reply's `planned_windows` is its length), and
+`cvq_prior_next` takes `goal` for its own window, which wins over the plan (`null` = none for
+that window). `"action":"null"` plus a goal is movement described by numbers only.
+`tests/test_cvqprior_goal_ops.py` drives these through a real `neon --interactive`.
 Windows are returned as sampled: overlapping/cross-fading them into a clip is the
 caller's job (NERVA's `stitch`; the exporter stores `stride`).
 ```
