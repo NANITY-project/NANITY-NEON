@@ -5,6 +5,7 @@ Put it in the repo root, then:
     python3 neon_ui.py --model models/SmolLM2-1.7B-nanity-Q4_0.gguf
     python3 neon_ui.py --model https://huggingface.co/<user>/<repo>/resolve/main/<file>.gguf
     python3 neon_ui.py --model some-plain.gguf      # auto-converted with nanity_convert.py (needs numpy)
+    python3 neon_ui.py --model <path> --task "Ancient history of France"   # sampler defaults: temp 0.7, top-p 0.9
     python3 neon_ui.py --selftest                   # tests the server against a fake neon, no model needed
 
 It builds ./neon if missing/stale (-DNANITY_ENABLE_IDLE_LOOP; fetches nectar_cot/splice from Project-Infinite if absent), fetches/converts the model,
@@ -152,6 +153,11 @@ def pipeline(a, gen):
         cmd = [str(exe), "--model", str(model), "--idle-loop", "--idle-cot"]
         if a.threads:
             cmd += ["--threads", str(a.threads)]
+        if a.task:
+            cmd += ["--idle-task", a.task]
+        for flag, val in (("--idle-temperature", "0.7"), ("--idle-top-p", "0.9")):   # defaults; override by passing the flag after --
+            if flag not in a.extra:
+                cmd += [flag, val]
         cmd += a.extra
         hub.status("starting", "loading model")
         p = subprocess.Popen(cmd, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
@@ -261,7 +267,7 @@ FAKE = r'''#!/usr/bin/env python3
 import sys, time
 if "--probe" in sys.argv: sys.exit(0)
 def out(s): sys.stdout.write(s); sys.stdout.flush()
-out("[fake-build]\n<think>")
+out("[fake-build] " + " ".join(sys.argv[1:]) + "\n<think>")
 import threading
 def reader():
     for line in sys.stdin:
@@ -278,7 +284,7 @@ def selftest():
     fake.write_text(FAKE)
     fake.chmod(0o755)
     (d / "m.gguf").write_bytes(b"x")
-    a = argparse.Namespace(model=str(d / "m.gguf"), neon_bin=str(fake), threads=None, extra=[], host="127.0.0.1", port=0, open=False)
+    a = argparse.Namespace(model=str(d / "m.gguf"), neon_bin=str(fake), threads=None, task="Ancient history", extra=[], host="127.0.0.1", port=0, open=False)
     srv, _ = serve(a)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     port = srv.server_port
@@ -297,6 +303,7 @@ def selftest():
                 assert c2.getresponse().status == 200
                 sent = True
     kill()
+    assert "--idle-task Ancient history" in seen.replace("\n", " ") and "--idle-temperature 0.7" in seen and "--idle-top-p 0.9" in seen, seen[:300]
     assert "[fake-build]" in seen and "[USER] ping" in seen and "<answer>echo ping</answer>" in seen, seen[-300:]
     page_ok = http.client.HTTPConnection("127.0.0.1", port)
     page_ok.request("GET", "/")
@@ -326,19 +333,19 @@ footer{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--line)}i
 const $=id=>document.getElementById(id),chat=$('chat');
 /*PARSER*/
 let buf='',mode=null,cur=null,ask=false,pend=0;
-const TAG=/<\/?(think|answer|next)>|\[USER\] ?|\[ASK\] ?/;
+const TAG=/<\/?(think|answer|next)>|\[USER\] ?|\[ASK\] ?|\[REPLY\] ?/;
 function add(t){if(!t||(!mode&&!t.trim()))return;const m=mode||'sys';
  if(!cur||cur.dataset.m!==m){cur=document.createElement('div');cur.dataset.m=m;
   cur.className=m==='answer'?'bub'+(ask?' ask':''):m==='user'?'bub me':m;chat.appendChild(cur);
-  while(chat.children.length>1500)chat.removeChild(chat.firstChild)}
+  while(chat.children.length>1500)chat.removeChild(chat.firstChild);t=t.replace(/^\s+/,'')}
  cur.textContent+=t;if(chat.scrollHeight-chat.scrollTop-chat.clientHeight<200)chat.scrollTop=chat.scrollHeight}
 function feed(s){buf+=s;for(;;){const m=TAG.exec(buf);
  if(!m){const k=Math.max(buf.lastIndexOf('<'),buf.lastIndexOf('['));
   if(k>=0&&buf.length-k<12){add(buf.slice(0,k));buf=buf.slice(k)}else{add(buf);buf=''}return}
  add(buf.slice(0,m.index));buf=buf.slice(m.index+m[0].length);const t=m[0];
  if(t[0]==='<'){if(t[1]==='/'){if(m[1]==='answer')ask=false;mode=null}else mode=m[1]}
- else if(t.startsWith('[USER]')){mode='user';ask=false;if(pend>0)pend--;queued()}else ask=true;
- cur=null}}
+ else if(t.startsWith('[USER]')){mode='user';ask=false;if(pend>0)pend--;queued()}else if(t.startsWith('[ASK]'))ask=true;
+ if(!t.startsWith('[REPLY]'))cur=null}}
 /*END*/
 function queued(){$('stats').dataset.q=pend?' | queued: '+pend:'';stat()}
 let chars=0,rate=0,cycles=0,shifts=0;
@@ -366,6 +373,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", help="path or http(s) URL of a GGUF (plain GGUFs are converted automatically)")
     ap.add_argument("--neon-bin", help="use this neon binary instead of building ./neon")
+    ap.add_argument("--task", help="topic the idle loop starts on (passed as --idle-task)")
     ap.add_argument("--threads", type=int)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
