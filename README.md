@@ -9,7 +9,7 @@ container format. The training pipeline, the converters and the
 specification are all designed around that one fixed shape on purpose.
 
 This repository and its code are provided 'as is' without any warranty.
-
+(If making a fork/taking implementation,please provide credits and make your code opensource as well)
 - Full technical contract (tensor names, metadata keys, container layouts):
   [`docs/NANITY_ARCHITECTURE_SPEC.md`](./docs/NANITY_ARCHITECTURE_SPEC.md)
 - Beyond language models, NEON also runs a **vision encoder** (Vision
