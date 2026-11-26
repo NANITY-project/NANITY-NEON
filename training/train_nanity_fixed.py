@@ -843,8 +843,11 @@ def collate_fn(batch, pad_id: int = 0):
 
         input_ids[i, :n]   = ids_t
         attn_mask[i, :n]   = True
-        labels[i, :n]      = torch.where(msk_t, ids_t, torch.full_like(ids_t, -100))
-        answer_mask[i, :n] = ans_t & msk_t
+        # NEXT-TOKEN SHIFT: logits at position t predict token t+1, so the label
+        # at t is ids[t+1] (if that token is loss-bearing). Without this shift
+        # the model is trained to output the token it was just given.
+        labels[i, :n - 1]      = torch.where(msk_t[1:], ids_t[1:], torch.full_like(ids_t[1:], -100))
+        answer_mask[i, :n - 1] = ans_t[1:] & msk_t[1:]
 
     return input_ids, labels, attn_mask, answer_mask
 
