@@ -1,83 +1,129 @@
 """
-fused_ce.py -- chunked linear + cross-entropy, pure PyTorch (no Triton / Liger / CUDA-only deps,
-so it works on ROCm and on CPU for debugging).
+fused_ce.py -- fused (chunked) output-projection + cross-entropy, pure PyTorch
+(no Triton / Liger / CUDA-only deps, so it runs on ROCm and CPU).
 
-Problem it solves
------------------
-modeling_nanity.py computes `logits = F.linear(h, W)` for every loss-bearing position, and the
-trainer then does `.float()` and `F.cross_entropy(...)`. For N loss tokens and vocab V that keeps
-alive, at the same time:  bf16 logits (2NV bytes) + fp32 copy (4NV) + CE softmax buffer (4NV)
-+ fp32 grad (4NV) + bf16 grad (2NV)  ~= 16NV bytes.
-With V=200064 and N=32768 (batch 4 x 8192) that is ~100 GB -- the constant OOM. In pretraining every
-position is loss-bearing, so `select_positions` gives no savings there.
+Why
+---
+With V=200064, a naive loss keeps bf16 logits + fp32 copy + softmax buffer + grads
+alive for every loss token at once: ~16*N*V bytes (N=32k tokens -> ~100 GB). That
+is the "constant OOM".
 
-This computes the loss in row-chunks under torch.utils.checkpoint: each chunk's logits exist only
-inside that chunk (forward) and are recomputed (backward), so peak memory is ~16 * chunk * V bytes
-(chunk=4096, V=200k: ~13 GB; V=50k: ~3 GB) regardless of N. Extra cost: one more output-projection
-matmul in backward (a few % of a step for a 1.5B model).
+How (same trick as Liger's FusedLinearCrossEntropy)
+---------------------------------------------------
+Walk the tokens in chunks. For each chunk, in the FORWARD pass:
+    logits = h_c @ W^T            (1 matmul)
+    loss_c, dlogits = CE(logits)  (elementwise, in place)
+    grad_h_c  = dlogits @ W       (1 matmul)
+    grad_W   += dlogits^T @ h_c   (1 matmul)
+and keep only grad_h (N x d) and grad_W (V x d). Backward just scales them by
+the incoming scalar grad. Total = 3 matmuls, the same as a normal fwd+bwd, so
+there is NO recompute (the checkpoint-based version needed a 4th matmul), and
+peak extra memory is ~ chunk*V*(2+4+2) bytes regardless of N.
 
-It returns the PER-TOKEN loss vector (fp32), so the trainer's answer/think weighting and logging
-keep working unchanged.
+Interface
+---------
+    loss, per_tok = fused_linear_ce(h, W, labels, scale, chunk=4096,
+                                    label_smoothing=0.0)
 
-How to use (3 small edits)
---------------------------
-1) modeling_nanity.py, NanityForCausalLM.forward: add a parameter `skip_logits: bool = False`
-   and, right after `h = self.output_norm(h)`:
-
-        if skip_logits:
-            return h, presents
-
-2) train_nanity_fixed.py (training loop AND evaluate()), replace
-
-        logits_valid, _ = model(input_ids, select_positions=valid_idx)
-        logits_valid = logits_valid.float()
-        ... per_tok = F.cross_entropy(logits_valid, labels_valid, label_smoothing=..., reduction="none")
-
-   with
-
-        from fused_ce import chunked_linear_ce
-        h, _ = model(input_ids, skip_logits=True)
-        h_valid = h.reshape(-1, h.shape[-1]).index_select(0, valid_idx)
-        base = model._orig_mod if hasattr(model, "_orig_mod") else model
-        per_tok = chunked_linear_ce(h_valid, base.output_weight(), labels_valid,
-                                    chunk=4096, label_smoothing=args.label_smoothing)
-
-   (The online-distillation branch needs full student logits for the KL term; leave that branch as is.)
-
-3) Pretraining (all positions loss-bearing): valid_idx is simply every position; pass the labels
-   already aligned to positions, exactly as the existing collate does.
+  h       [N, d]  hidden states (compute dtype, e.g. bf16), requires grad
+  W       [V, d]  output / tied-embedding weight (fp32 master is fine; it is
+                  cast to h.dtype for the matmuls, grad comes back fp32)
+  labels  [N]     target ids, -100 = ignore
+  scale   [N]     fp32 per-token weight INCLUDING the normalisation, i.e.
+                  loss = sum_i scale_i * ce_i  (e.g. w_i / sum(w))
+  returns loss (scalar, differentiable) and per_tok (fp32 [N], detached CE per
+  token, for think/answer logging).
 """
+from __future__ import annotations
+
 import torch
-import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
+
+IGNORE = -100
 
 
-def _chunk_loss(h, weight, labels, label_smoothing: float, ignore_index: int):
-    logits = F.linear(h, weight).float()
-    return F.cross_entropy(
-        logits, labels, reduction="none",
-        label_smoothing=label_smoothing, ignore_index=ignore_index,
-    )
+def _chunk_forward(hc, w, lc, ls, V):
+    """Returns (logits_f32 [c,V], lse [c], ce [c], valid [c], lc_safe [c])."""
+    logits = (hc @ w.t()).float()
+    valid = lc != IGNORE
+    lc_safe = lc.clamp(min=0)
+    lse = torch.logsumexp(logits, dim=-1)
+    tgt = logits.gather(1, lc_safe[:, None]).squeeze(1)
+    ce = lse - tgt
+    if ls > 0.0:
+        smooth = lse - logits.mean(dim=-1)
+        ce = (1.0 - ls) * ce + ls * smooth
+    ce = torch.where(valid, ce, torch.zeros_like(ce))
+    return logits, lse, ce, valid, lc_safe
 
 
-def chunked_linear_ce(
-    h: torch.Tensor,            # [N, d]  final hidden states (after output_norm)
-    weight: torch.Tensor,       # [V, d]  output / tied embedding matrix
-    labels: torch.Tensor,       # [N]     target ids (ignore_index rows give 0 loss)
-    chunk: int = 4096,
-    label_smoothing: float = 0.0,
-    ignore_index: int = -100,
-) -> torch.Tensor:
-    """Per-token cross-entropy of softmax(h @ weight.T) vs labels, fp32, shape [N]."""
+class _FusedLinearCE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, h, weight, labels, scale, chunk, label_smoothing):
+        n, d = h.shape
+        V = weight.shape[0]
+        cdt = h.dtype
+        need_h, need_w = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
+        w = weight if weight.dtype == cdt else weight.to(cdt)
+
+        per_tok = torch.zeros(n, dtype=torch.float32, device=h.device)
+        loss = torch.zeros((), dtype=torch.float32, device=h.device)
+        grad_h = torch.empty_like(h) if need_h else None
+        grad_w = torch.zeros(weight.shape, dtype=torch.float32, device=h.device) if need_w else None
+
+        for i in range(0, n, chunk):
+            hc, lc, sc = h[i:i + chunk], labels[i:i + chunk], scale[i:i + chunk]
+            logits, lse, ce, valid, lc_safe = _chunk_forward(hc, w, lc, label_smoothing, V)
+            per_tok[i:i + chunk] = ce
+            loss += (ce * sc).sum()
+            if need_h or need_w:
+                # d ce / d logits = softmax - target_dist, built in place.
+                logits.sub_(lse[:, None]).exp_()                 # softmax
+                if label_smoothing > 0.0:
+                    logits.sub_(label_smoothing / V)             # uniform part
+                rows = torch.arange(logits.shape[0], device=logits.device)
+                logits[rows, lc_safe] -= (1.0 - label_smoothing)  # one-hot part
+                logits.mul_((sc * valid)[:, None])
+                gl = logits.to(cdt)
+                del logits
+                if need_h:
+                    grad_h[i:i + chunk] = gl @ w
+                if need_w:
+                    grad_w += (gl.t() @ hc)                      # bf16 GEMM, fp32 accumulate
+                del gl
+
+        ctx.mark_non_differentiable(per_tok)
+        ctx.save_for_backward(grad_h, grad_w)
+        return loss, per_tok
+
+    @staticmethod
+    def backward(ctx, grad_loss, _grad_per_tok):
+        grad_h, grad_w = ctx.saved_tensors
+        g = grad_loss
+        return (
+            grad_h * g.to(grad_h.dtype) if grad_h is not None else None,
+            grad_w * g if grad_w is not None else None,
+            None, None, None, None,
+        )
+
+
+@torch.no_grad()
+def linear_ce_per_token(h, weight, labels, chunk=4096, label_smoothing=0.0):
+    """Eval path: per-token CE (fp32 [N]) without any gradient work."""
     n = h.shape[0]
-    if n <= chunk:
-        return _chunk_loss(h, weight, labels, label_smoothing, ignore_index)
-    out = []
+    V = weight.shape[0]
+    w = weight if weight.dtype == h.dtype else weight.to(h.dtype)
+    out = torch.zeros(n, dtype=torch.float32, device=h.device)
     for i in range(0, n, chunk):
-        hc, lc = h[i:i + chunk], labels[i:i + chunk]
-        if torch.is_grad_enabled() and (h.requires_grad or weight.requires_grad):
-            out.append(checkpoint(_chunk_loss, hc, weight, lc, label_smoothing, ignore_index,
-                                  use_reentrant=False))
-        else:
-            out.append(_chunk_loss(hc, weight, lc, label_smoothing, ignore_index))
-    return torch.cat(out)
+        _, _, ce, _, _ = _chunk_forward(h[i:i + chunk], w, labels[i:i + chunk], label_smoothing, V)
+        out[i:i + chunk] = ce
+    return out
+
+
+def fused_linear_ce(h, weight, labels, scale, chunk=4096, label_smoothing=0.0):
+    if h.shape[0] == 0:  # batch with no loss tokens
+        z = (h.sum() + weight.sum()) * 0.0
+        return z, torch.zeros(0, dtype=torch.float32, device=h.device)
+    if not torch.is_grad_enabled():
+        pt = linear_ce_per_token(h, weight, labels, chunk, label_smoothing)
+        return (pt * scale).sum(), pt
+    return _FusedLinearCE.apply(h, weight, labels, scale, chunk, label_smoothing)
