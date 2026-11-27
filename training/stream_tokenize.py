@@ -29,6 +29,12 @@ Example:
         --tokenizer ./tokenizer.json --eos-token "<|endoftext|>" \
         --repo-id YOURNAME/nectar8-tokens --prefix fineweb-edu \
         --max-tokens 16e9
+
+Several sources in one command (run sequentially, finished ones are skipped on re-run):
+    python stream_tokenize.py --tokenizer ./tokenizer.json --eos-token "<|endoftext|>" \
+        --repo-id YOURNAME/nectar8-tokens --sources sources.json
+sources.json is a list of objects with any of: dataset, config, split, data_dir, data_files,
+text_field, prefix, max_tokens, shard_tokens, batch_docs.
 """
 import os
 
@@ -169,11 +175,13 @@ def run(args, ds, tok, api, state):
     it = iter(ds)
     t0 = last_print = time.time()
     session_tokens = 0
+    exhausted = interrupted = False
     try:
         while not up.error:
             docs = list(itertools.islice(it, args.batch_docs))
             if not docs:
                 print("[done] dataset exhausted", flush=True)
+                exhausted = True
                 break
             pending = ds.state_dict()
             texts = [d[args.text_field] for d in docs if d.get(args.text_field)]
@@ -200,6 +208,7 @@ def run(args, ds, tok, api, state):
                 print("[done] reached --max-tokens", flush=True)
                 break
     except KeyboardInterrupt:
+        interrupted = True
         print("\n[stop] Ctrl-C: uploading the partial shard, please wait (Ctrl-C again to abort)...", flush=True)
 
     try:
@@ -211,11 +220,17 @@ def run(args, ds, tok, api, state):
     up.join()
     if up.error:
         sys.exit(f"ERROR: {up.error}. Re-run the same command to resume.")
+    if exhausted:  # mark the source as fully consumed so re-runs skip it
+        final = {"next_shard": shard_idx, "tokens": total_tokens, "docs": total_docs,
+                 "ds_state": committed, "dataset": args.dataset, "config": args.config, "done": True}
+        api.upload_file(path_or_fileobj=json.dumps(final).encode(), path_in_repo=f"{args.prefix}/state.json",
+                        repo_id=args.repo_id, repo_type="dataset", commit_message=f"{args.prefix}: done")
     print(
         f"[finished] {total_tokens:,} tokens total, {up.shards_done} shards uploaded this run "
         f"({up.bytes_done / 1e9:.2f} GB)",
         flush=True,
     )
+    return "interrupted" if interrupted else "ok"
 
 
 # ----------------------------------------------------------------------------
@@ -235,31 +250,36 @@ def fetch_state(api, args):
         return json.load(f)
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--dataset", required=True, help="HF dataset id, e.g. HuggingFaceFW/fineweb-edu")
+    ap.add_argument("--dataset", help="HF dataset id, e.g. HuggingFaceFW/fineweb-edu")
     ap.add_argument("--config", default=None, help="dataset config/subset name, e.g. sample-100BT")
+    ap.add_argument("--data-dir", default=None, help="data_dir passed to load_dataset (e.g. a language folder)")
+    ap.add_argument("--data-files", default=None, help="data_files passed to load_dataset (path or glob in the repo)")
     ap.add_argument("--split", default="train")
     ap.add_argument("--text-field", default="text")
     ap.add_argument("--tokenizer", required=True, help="path to tokenizer.json, or a HF repo id")
     ap.add_argument("--eos-token", required=True, help="document-separator token, must exist in the tokenizer")
     ap.add_argument("--repo-id", required=True, help="destination HF dataset repo, e.g. you/nectar8-tokens")
-    ap.add_argument("--prefix", required=True, help="folder inside the repo, e.g. fineweb-edu")
+    ap.add_argument("--prefix", help="folder inside the repo, e.g. fineweb-edu")
+    ap.add_argument("--sources", default=None,
+                    help="JSON file with a list of sources to process one after another (overrides per-source flags)")
     ap.add_argument("--shard-tokens", type=lambda s: int(float(s)), default=100_000_000,
-                    help="approx tokens per shard (default 100M = 200MB as uint16). Avoid tiny shards: HF rate-limits commits")
+                    help="approx tokens per shard (default 100M). Avoid tiny shards: HF rate-limits commits")
     ap.add_argument("--batch-docs", type=int, default=1000, help="documents tokenized per batch")
     ap.add_argument("--max-tokens", type=lambda s: int(float(s)), default=0,
                     help="stop after this many tokens in total (across resumes), e.g. 16e9; 0 = whole dataset")
     ap.add_argument("--public", action="store_true", help="create the repo as public (default: private)")
     ap.add_argument("--fresh", action="store_true", help="ignore saved progress and start over (overwrites shards)")
-    args = ap.parse_args()
+    return ap
 
+
+def process(args, tok, api):
+    """Handle one source. Returns 'skipped', 'ok' or 'interrupted'."""
     from datasets import load_dataset
-    from huggingface_hub import HfApi
 
-    tok = load_tokenizer(args.tokenizer)
-    api = HfApi()
-    api.create_repo(args.repo_id, repo_type="dataset", private=not args.public, exist_ok=True)
+    if not args.dataset or not args.prefix:
+        sys.exit("each source needs both a dataset and a prefix")
 
     state = None
     if not args.fresh:
@@ -270,8 +290,16 @@ def main():
             if existing:
                 sys.exit(f"Repo already has {len(existing)} shards under '{args.prefix}/' but no state.json. "
                          f"Refusing to overwrite; use a different --prefix or pass --fresh.")
+        elif state.get("done"):
+            print(f"[skip] {args.prefix}: dataset already fully consumed ({state['tokens']:,} tokens)", flush=True)
+            return "skipped"
+        elif args.max_tokens and state["tokens"] >= args.max_tokens:
+            print(f"[skip] {args.prefix}: already at {state['tokens']:,} tokens (>= max-tokens)", flush=True)
+            return "skipped"
 
-    ds = load_dataset(args.dataset, name=args.config, split=args.split, streaming=True)
+    print(f"\n===== {args.prefix}: {args.dataset} {args.config or ''} {args.data_dir or ''} =====", flush=True)
+    ds = load_dataset(args.dataset, name=args.config, split=args.split, streaming=True,
+                      data_dir=args.data_dir, data_files=args.data_files)
     if not hasattr(ds, "state_dict"):
         sys.exit("Your `datasets` version has no IterableDataset.state_dict(); run: pip install -U datasets")
 
@@ -285,15 +313,51 @@ def main():
             "tokenizer": os.path.basename(args.tokenizer),
             "source_dataset": args.dataset,
             "source_config": args.config,
+            "source_data_dir": args.data_dir,
             "format": "flat token ids, documents separated by eos_id",
         }
         api.upload_file(path_or_fileobj=json.dumps(meta, indent=2).encode(),
                         path_in_repo=f"{args.prefix}/meta.json", repo_id=args.repo_id, repo_type="dataset")
-        if os.path.isfile(args.tokenizer):  # keep the exact tokenizer next to the shards
+
+    return run(args, ds, tok, api, state)
+
+
+def main():
+    import copy
+
+    from huggingface_hub import HfApi
+
+    args = build_parser().parse_args()
+    tok = load_tokenizer(args.tokenizer)
+    api = HfApi()
+    api.create_repo(args.repo_id, repo_type="dataset", private=not args.public, exist_ok=True)
+    if os.path.isfile(args.tokenizer):  # keep the exact tokenizer in the repo root (once)
+        try:
+            have = api.file_exists(args.repo_id, "tokenizer.json", repo_type="dataset")
+        except Exception:
+            have = False
+        if not have:
             api.upload_file(path_or_fileobj=args.tokenizer, path_in_repo="tokenizer.json",
                             repo_id=args.repo_id, repo_type="dataset")
 
-    run(args, ds, tok, api, state)
+    if not args.sources:
+        process(args, tok, api)
+        return
+
+    with open(args.sources) as f:
+        specs = json.load(f)
+    int_keys = {"max_tokens", "shard_tokens"}
+    for i, spec in enumerate(specs, 1):
+        a = copy.copy(args)
+        for k, v in spec.items():
+            k = k.replace("-", "_")
+            if not hasattr(a, k):
+                sys.exit(f"unknown key {k!r} in {args.sources} (entry {i})")
+            setattr(a, k, int(float(v)) if k in int_keys else v)
+        print(f"\n[{i}/{len(specs)}] {a.prefix}", flush=True)
+        if process(a, tok, api) == "interrupted":
+            print("[stop] interrupted: remaining sources not started. Re-run the same command to continue.", flush=True)
+            break
 
 
 if __name__ == "__main__":
